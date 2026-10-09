@@ -1,0 +1,516 @@
+{
+  "schemaVersion": "1.0",
+  "modelId": "c9db5a658c584955859280be904a7097",
+  "updatedAt": "2026-10-01T09:50:33.881Z",
+  "actions": [
+    {
+      "id": "neutral",
+      "label": "自然",
+      "category": "expression",
+      "description": "回到角色默认表情",
+      "durationMs": 900,
+      "fadeInMs": 100,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthForm",
+          "label": "嘴形",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowLY",
+          "label": "左眉",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowRY",
+          "label": "右眉",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "gentle_smile",
+      "label": "微笑",
+      "category": "expression",
+      "description": "明显、温和的笑意",
+      "durationMs": 1800,
+      "fadeInMs": 200,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthForm",
+          "label": "嘴形",
+          "from": 0,
+          "to": 0.95,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowLY",
+          "label": "左眉",
+          "from": 0,
+          "to": 0.3,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowRY",
+          "label": "右眉",
+          "from": 0,
+          "to": 0.3,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "concerned",
+      "label": "关切",
+      "category": "expression",
+      "description": "收紧眉眼并减弱笑意",
+      "durationMs": 1700,
+      "fadeInMs": 200,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthForm",
+          "label": "嘴形",
+          "from": 0,
+          "to": -0.85,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowLY",
+          "label": "左眉",
+          "from": 0,
+          "to": -0.58,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowRY",
+          "label": "右眉",
+          "from": 0,
+          "to": -0.58,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeLOpen",
+          "label": "左眼开合",
+          "from": 1,
+          "to": 0.62,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeROpen",
+          "label": "右眼开合",
+          "from": 1,
+          "to": 0.62,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "sad",
+      "label": "难过",
+      "category": "expression",
+      "description": "明显的低落表情",
+      "durationMs": 1900,
+      "fadeInMs": 200,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthForm",
+          "label": "嘴形",
+          "from": 0,
+          "to": -1.1,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowLY",
+          "label": "左眉",
+          "from": 0,
+          "to": -0.89,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowRY",
+          "label": "右眉",
+          "from": 0,
+          "to": -0.86,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeLOpen",
+          "label": "左眼开合",
+          "from": 1,
+          "to": 0.48,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeROpen",
+          "label": "右眼开合",
+          "from": 1,
+          "to": 0.48,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "Param4",
+          "label": "嘟嘴",
+          "from": 0,
+          "to": 0.32,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "confused",
+      "label": "困惑",
+      "category": "expression",
+      "description": "明显歪头和不对称眉形",
+      "durationMs": 1600,
+      "fadeInMs": 500,
+      "fadeOutMs": 350,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthForm",
+          "label": "嘴形",
+          "from": 0,
+          "to": -0.38,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowLY",
+          "label": "左眉",
+          "from": 0,
+          "to": 0.62,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBrowRY",
+          "label": "右眉",
+          "from": 0,
+          "to": -0.42,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamAngleZ",
+          "label": "头部倾斜",
+          "from": 0,
+          "to": -14.54,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "Param6",
+          "label": "歪嘴",
+          "from": 0,
+          "to": 0.45,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "idle",
+      "label": "待机",
+      "category": "state",
+      "description": "轻呼吸、微摆并允许自然眨眼",
+      "durationMs": 5000,
+      "fadeInMs": 340,
+      "fadeOutMs": 380,
+      "tracks": [
+        {
+          "parameterId": "ParamBreath",
+          "label": "呼吸",
+          "from": 0,
+          "to": 0.8,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamAngleZ",
+          "label": "头部轻摆",
+          "from": -4,
+          "to": 4,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBodyAngleZ",
+          "label": "身体轻摆",
+          "from": -2,
+          "to": 2,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "listening",
+      "label": "倾听",
+      "category": "state",
+      "description": "看向用户并微微点头",
+      "durationMs": 1400,
+      "fadeInMs": 400,
+      "fadeOutMs": 250,
+      "tracks": [
+        {
+          "parameterId": "ParamEyeBallX",
+          "label": "眼球水平",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeBallY",
+          "label": "眼球垂直",
+          "from": 0,
+          "to": 0.3,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamAngleY",
+          "label": "头部俯仰",
+          "from": 0,
+          "to": -11.16,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "thinking",
+      "label": "思考",
+      "category": "state",
+      "description": "视线移开并侧头思考",
+      "durationMs": 1600,
+      "fadeInMs": 500,
+      "fadeOutMs": 350,
+      "tracks": [
+        {
+          "parameterId": "ParamEyeBallX",
+          "label": "眼球水平",
+          "from": 0,
+          "to": -0.55,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeBallY",
+          "label": "眼球垂直",
+          "from": 0,
+          "to": 0.35,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamAngleZ",
+          "label": "头部倾斜",
+          "from": 0,
+          "to": -8,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "speaking",
+      "label": "说话",
+      "category": "state",
+      "description": "实际播放语音时按音频能量驱动的口型",
+      "durationMs": 300,
+      "fadeInMs": 200,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthOpenY",
+          "label": "嘴部开合",
+          "from": 0,
+          "to": 0.48,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "gaze_center",
+      "label": "注视中心",
+      "category": "gaze",
+      "description": "视线回到画面中心",
+      "durationMs": 900,
+      "fadeInMs": 100,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamEyeBallX",
+          "label": "眼球水平",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeBallY",
+          "label": "眼球垂直",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "gaze_away",
+      "label": "移开视线",
+      "category": "gaze",
+      "description": "明显移开视线",
+      "durationMs": 1000,
+      "fadeInMs": 300,
+      "fadeOutMs": 250,
+      "tracks": [
+        {
+          "parameterId": "ParamEyeBallX",
+          "label": "眼球水平",
+          "from": 0,
+          "to": 0.72,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeBallY",
+          "label": "眼球垂直",
+          "from": 0,
+          "to": -0.28,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "nod",
+      "label": "点头",
+      "category": "gesture",
+      "description": "幅度明显的点头",
+      "durationMs": 1500,
+      "fadeInMs": 400,
+      "fadeOutMs": 350,
+      "tracks": [
+        {
+          "parameterId": "ParamAngleY",
+          "label": "头部俯仰",
+          "from": 0,
+          "to": 15,
+          "curve": "ease-out"
+        },
+        {
+          "parameterId": "ParamBodyAngleY",
+          "label": "身体俯仰",
+          "from": 0,
+          "to": 4,
+          "curve": "ease-out"
+        }
+      ]
+    },
+    {
+      "id": "shake_head",
+      "label": "摇头",
+      "category": "gesture",
+      "description": "幅度明显的左右摇头",
+      "durationMs": 1500,
+      "fadeInMs": 500,
+      "fadeOutMs": 250,
+      "tracks": [
+        {
+          "parameterId": "ParamAngleX",
+          "label": "头部左右",
+          "from": -14,
+          "to": 14,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBodyAngleX",
+          "label": "身体左右",
+          "from": -3,
+          "to": 3,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "tilt",
+      "label": "歪头",
+      "category": "gesture",
+      "description": "头部向一侧明显倾斜",
+      "durationMs": 1300,
+      "fadeInMs": 300,
+      "fadeOutMs": 350,
+      "tracks": [
+        {
+          "parameterId": "ParamAngleZ",
+          "label": "头部倾斜",
+          "from": 0,
+          "to": 15,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamBodyAngleZ",
+          "label": "身体倾斜",
+          "from": 0,
+          "to": 4,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "lower_head",
+      "label": "低头",
+      "category": "gesture",
+      "description": "明显低头并带动视线下垂",
+      "durationMs": 1200,
+      "fadeInMs": 400,
+      "fadeOutMs": 350,
+      "tracks": [
+        {
+          "parameterId": "ParamAngleY",
+          "label": "头部俯仰",
+          "from": 0,
+          "to": -15,
+          "curve": "smooth"
+        },
+        {
+          "parameterId": "ParamEyeBallY",
+          "label": "眼球垂直",
+          "from": 0,
+          "to": -0.32,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "mouth_open",
+      "label": "口型：张开",
+      "category": "viseme",
+      "description": "调试口型幅度；正式驱动来自播放音频",
+      "durationMs": 900,
+      "fadeInMs": 200,
+      "fadeOutMs": 250,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthOpenY",
+          "label": "嘴部开合",
+          "from": 0,
+          "to": 1,
+          "curve": "smooth"
+        }
+      ]
+    },
+    {
+      "id": "mouth_closed",
+      "label": "口型：闭合",
+      "category": "viseme",
+      "description": "停止播放时嘴形归零",
+      "durationMs": 500,
+      "fadeInMs": 100,
+      "fadeOutMs": 150,
+      "tracks": [
+        {
+          "parameterId": "ParamMouthOpenY",
+          "label": "嘴部开合",
+          "from": 0,
+          "to": 0,
+          "curve": "smooth"
+        }
+      ]
+    }
+  ]
+}

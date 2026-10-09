@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  作用：提供前端应用的 HTML 页面入口。
+  当前功能：
+  - 声明中文页面与移动视口信息。
+  - 在 React 启动前加载本地 Cubism Core 运行时。
+  - 提供 React 根节点并加载前端入口模块。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+    <meta name="theme-color" content="#0b1020"/>
+    <title>MIRA · Avatar Studio</title>
+    <!-- 在模块脚本执行前提供 Live2D 所需的全局 Cubism Core。 -->
+    <script src="/vendor/live2dcubismcore.min.js"></script>
+  </head>
+  <body>
+    <!-- React 应用挂载位置。 -->
+    <div id="root"></div>
+    <!-- 加载 React 应用入口。 -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

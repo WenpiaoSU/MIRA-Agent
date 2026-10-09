@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mira-agent.local/schemas/avatar-mapping.schema.json",
+  "title": "MIRA Avatar Mapping",
+  "type": "object",
+  "required": ["schemaVersion", "modelId", "mappingVersion", "updatedAt", "actions"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "modelId": { "type": "string" },
+    "mappingVersion": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "category", "description", "durationMs", "fadeInMs", "fadeOutMs", "tracks"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "category": { "enum": ["expression", "state", "gaze", "gesture", "viseme"] },
+          "description": { "type": "string" },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "fadeInMs": { "type": "integer", "minimum": 0 },
+          "fadeOutMs": { "type": "integer", "minimum": 0 },
+          "tracks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["parameterId", "label", "from", "to", "curve"],
+              "properties": {
+                "parameterId": { "type": "string" },
+                "label": { "type": "string" },
+                "from": { "type": "number" },
+                "to": { "type": "number" },
+                "curve": { "enum": ["smooth", "linear", "ease-in", "ease-out", "spring"] },
+                "keyframes": { "type": "array", "items": { "type": "object", "required": ["at", "value"], "properties": { "at": { "type": "number", "minimum": 0, "maximum": 1 }, "value": { "type": "number" } } } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

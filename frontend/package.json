@@ -1,0 +1,9 @@
+{
+  "name": "mira-agent-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview", "test": "node --test tests/*.test.mjs", "typecheck": "tsc --noEmit" },
+  "dependencies": { "lucide-react": "^0.468.0", "pixi-live2d-display": "^0.4.0", "pixi.js": "6.5.10", "react": "^18.3.1", "react-dom": "^18.3.1" },
+  "devDependencies": { "@types/react": "^18.3.12", "@types/react-dom": "^18.3.1", "@vitejs/plugin-react": "^4.3.4", "typescript": "^5.7.2", "vite": "^6.0.5" }
+}

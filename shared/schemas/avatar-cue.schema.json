@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mira.local/schemas/avatar-cue.schema.json",
+  "title": "MIRA Agent Avatar cue",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["expression", "gaze", "gesture", "intensity"],
+  "properties": {
+    "expression": { "enum": ["neutral", "gentle_smile", "concerned", "sad", "confused"] },
+    "gaze": { "enum": ["center", "away"] },
+    "gesture": { "enum": [null, "nod", "shake_head", "tilt", "lower_head"] },
+    "intensity": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}
