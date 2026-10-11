@@ -3,10 +3,12 @@
 当前功能：
 - 区分文本展示、音频播放、取消确认及播放失败。
 - 保存带来源和精确度标志的中断快照。
+- 在输出账本保存单次工具结果，恢复时复述原事实而不重复执行。
 """
 
 from typing import Literal
 from pydantic import BaseModel, Field
+from src.contracts.tools import ToolResult
 
 
 class SegmentDelivery(BaseModel):
@@ -46,6 +48,7 @@ class OutputRecord(BaseModel):
     trace_id: str
     connection_epoch: int
     speech_enabled: bool
+    tool_result: ToolResult | None = None
     segments: dict[str, SegmentDelivery] = Field(default_factory=dict)
     response_complete: bool = False
     synthesis_complete: bool = False

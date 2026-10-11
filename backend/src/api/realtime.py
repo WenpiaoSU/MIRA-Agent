@@ -6,6 +6,8 @@
 - 直接执行插话取消，保留旧输出最终回执与恢复快照。
 - 委托有界输出协调器调度 TTS，并提供状态与共享因果轨迹。
 - 在断线、接管、超时及会话删除时回收全部连接任务。
+- 在可取消的生成任务中识别最终意图，冻结结果后交给现有 Agent 路由。
+- 提供真实工具目录、保存会话参数澄清及结果，过滤取消后的旧工具事件。
 """
 
 import asyncio
@@ -21,8 +23,10 @@ from src.contracts.realtime import (
     AudioEndInput, AudioFrameInput, AudioStartInput, CommandAckInput, DisplayedInput,
     PlaybackInput, StopInput, TextInput,
 )
+from src.contracts.tools import PendingClarification, ToolResult
 from src.evaluation.trace import now_ms
 from src.gateway.sender import EventSender
+from src.intent.service import build_context_summary
 from src.output.coordinator import OutputCoordinator
 from src.providers.llm import LLMError
 from src.speech.asr import ASRError
@@ -113,12 +117,15 @@ async def realtime(websocket: WebSocket, session_id: str):
         """仅在全部音频终态后报告真实交付或降级结果。"""
         record = session.finish_if_delivered()
         if record:
+            # 新回复已交付后，下一次重述应指向最新输出，不沿用更早的中断。
+            if session.interruption and session.interruption.generation_id != record.generation_id:
+                session.interruption = None
             await send("turn.delivered", {"generation_id": record.generation_id, "status": record.status},
                        record.turn_id, record.generation_id)
             await send_state(record.turn_id)
 
-    async def generate(text, turn_id, generation_id):
-        """运行现有 Agent，输出调度独立于网关接收与 VAD。"""
+    async def generate(text, turn_id, generation_id, source):
+        """在可取消任务内完成分类与生成，不阻塞网关接收和 VAD。"""
         coordinator = None
         try:
             if session.interruption and not session.interruption.stop_confirmed:
@@ -130,8 +137,45 @@ async def realtime(websocket: WebSocket, session_id: str):
                         await asyncio.sleep(.02)
             if session.generation_id != generation_id:
                 return
-            runtime_context = {"social_state": session.social_snapshot(text).model_dump(),
-                               "interruption_state": session.interruption.model_dump() if session.interruption else None}
+            history = session.context_history(generation_id)
+            summary = build_context_summary(history, session.interruption.model_dump() if session.interruption else None)
+            started_ms = now_ms()
+            registry = getattr(websocket.app.state, "tool_registry", None)
+            available_tools = registry.list_tools() if registry else []
+            pending = session.pending_clarification
+            classify_options = {"source": source}
+            if pending:
+                classify_options["pending_clarification"] = pending.model_copy(deep=True)
+            intent = await websocket.app.state.intent_service.classify(text, summary, available_tools, **classify_options)
+            # 即使提供者吞掉取消，旧分类结果也不能更新状态或开始输出。
+            if session.generation_id != generation_id or session.connection_epoch != epoch:
+                return
+            record = session.outputs[generation_id]
+            # 分类降级时保留原待澄清请求；独立的新任务和控制请求清除它。
+            if not intent.continues_pending and not (intent.intent == "other" and intent.confidence is None):
+                session.pending_clarification = None
+            session.trace.record("intent.classified", record.trace_id,
+                                 {"generation_id": generation_id, "intent": intent.intent,
+                                  "confidence": intent.confidence, "needs_clarification": intent.needs_clarification,
+                                  "elapsed_ms": now_ms() - started_ms})
+            if intent.intent == "control" and not intent.needs_clarification:
+                if intent.control_action == "change_topic":
+                    session.interruption = None
+                if intent.control_action in {"stop", "cancel", "change_topic"}:
+                    session.pending_clarification = None
+                elif intent.control_action in {"repeat", "resume"} and session.interruption is None:
+                    previous = [item for item in session.outputs.values() if item.generation_id != generation_id]
+                    if previous:
+                        session.interruption = session.snapshot_interruption(previous[-1])
+            runtime_context = {"social_state": session.social_snapshot(text, intent).model_dump(),
+                               "interruption_state": session.interruption.model_dump() if session.interruption else None,
+                               "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None}
+            if session.interruption:
+                interrupted_record = session.outputs.get(session.interruption.generation_id)
+                if interrupted_record and interrupted_record.tool_result:
+                    runtime_context["interrupted_tool_result"] = interrupted_record.tool_result.model_dump(mode="json")
+                    if intent.intent == "control" and intent.control_action in {"repeat", "resume"}:
+                        record.tool_result = interrupted_record.tool_result.model_copy(deep=True)
             await send_state(turn_id, generation_id)
             if settings.tts_ready:
                 async def send_output(kind, payload):
@@ -142,11 +186,27 @@ async def realtime(websocket: WebSocket, session_id: str):
             expression = "neutral"
             record = session.outputs[generation_id]
             async for item in websocket.app.state.agent.stream(
-                text, session.context_history(generation_id), session.recent_avatar_cues.copy(),
+                text, history, session.recent_avatar_cues.copy(),
                 generation_id, runtime_context=runtime_context):
                 if session.generation_id != generation_id or session.connection_epoch != epoch:
                     return
                 kind, payload = item["type"], item["payload"]
+                if kind == "tool.pending":
+                    session.pending_clarification = (PendingClarification.model_validate(payload["pending"])
+                                                     if payload["pending"] else None)
+                    continue
+                if kind == "tool.result":
+                    record.tool_result = ToolResult.model_validate(payload["result"])
+                    result = record.tool_result
+                    session.trace.record("tool.completed", record.trace_id,
+                                         {"generation_id": generation_id, "call_id": result.call_id,
+                                          "tool_name": result.tool_name, "status": result.status,
+                                          "verified": result.verified, "elapsed_ms": result.elapsed_ms,
+                                          "error_code": result.error.code if result.error else None})
+                    continue
+                if kind == "tool.started":
+                    session.trace.record(kind, record.trace_id, {"generation_id": generation_id, **payload})
+                    continue
                 if kind == "behavior.plan":
                     expression = payload["face"]["expression"]
                     # 文字降级仍即时执行；有音频时在前端实际首音时启动动作。
@@ -185,21 +245,22 @@ async def realtime(websocket: WebSocket, session_id: str):
             if session.generation_task is asyncio.current_task():
                 session.generation_task = None
 
-    async def bounded_generate(text, turn_id, generation_id):
-        """为整轮生成与合成设置总预算，超时也走同一取消协议。"""
+    async def bounded_generate(text, turn_id, generation_id, source):
+        """为分类、生成与合成设置整轮预算，超时走同一取消协议。"""
         try:
             async with asyncio.timeout(getattr(settings, "generation_timeout_ms", 120000) / 1000):
-                await generate(text, turn_id, generation_id)
+                await generate(text, turn_id, generation_id, source)
         except TimeoutError:
             if session.connection_epoch == epoch and session.generation_id == generation_id:
                 await cancel("generation_timeout")
                 await send("error", {"code": "generation_timeout", "message": "本轮回复超时，已停止，请重试。",
                                     "retryable": True}, turn_id, generation_id)
 
-    async def submit_turn(text, turn_id, trace_id=None):
+    async def submit_turn(text, turn_id, trace_id=None, source="text"):
         """保存最终输入，明确控制短句走快捷路径，其余进入同一个 Agent。"""
         action = control_action(text)
         if action == "stop":
+            session.pending_clarification = None
             await cancel("user_stop")
             await send("turn.controlled", {"action": "stop"}, turn_id)
             await send_state(turn_id)
@@ -207,13 +268,14 @@ async def realtime(websocket: WebSocket, session_id: str):
         await cancel("new_turn")
         if action == "change_topic":
             session.interruption = None
+            session.pending_clarification = None
         if action == "repeat" and session.interruption is None and session.outputs:
             session.interruption = session.snapshot_interruption(next(reversed(session.outputs.values())))
         generation_id = str(uuid4())
         session.begin_generation(generation_id, turn_id, text, trace_id or turn_id, settings.tts_ready)
         await send("turn.state", {"state": "received", "user_speaking": False,
                                 "robot_playing": False, "continuous": session.turn.continuous}, turn_id, generation_id)
-        task = asyncio.create_task(bounded_generate(text, turn_id, generation_id))
+        task = asyncio.create_task(bounded_generate(text, turn_id, generation_id, source))
         generation_tasks.add(task)
         task.add_done_callback(generation_tasks.discard)
         session.generation_task = task
@@ -255,7 +317,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                             await cancel("speech_during_thinking")
                     if kind == "turn.completed":
                         await send(kind, payload, turn_id, source="turn", trace_id=trace_id)
-                        await submit_turn(payload["text"], turn_id, trace_id)
+                        await submit_turn(payload["text"], turn_id, trace_id, source="speech")
                         turn_id = str(uuid4())
                         if not continuous:
                             return
@@ -387,6 +449,7 @@ async def realtime(websocket: WebSocket, session_id: str):
             elif kind == "control.stop":
                 target = payload.generation_id
                 if target is None or target == session.generation_id:
+                    session.pending_clarification = None
                     await cancel("user_stop")
                 elif target in session.outputs and session.outputs[target].status == "cancelled":
                     await send("output.cancel", session.cancel_payload(target), generation_id=target)
@@ -415,6 +478,7 @@ async def realtime(websocket: WebSocket, session_id: str):
         if audio_task and not audio_task.done():
             audio_task.cancel()
         if session.connection_epoch == epoch:
+            session.pending_clarification = None
             task = session.generation_task
             session.cancel_generation("disconnect")
             session.turn.disconnected = True

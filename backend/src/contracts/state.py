@@ -3,10 +3,12 @@
 当前功能：
 - 分离用户语音活动与机器人实际播放状态。
 - 为 Agent 提供状态版本、最终输入、中断和健康摘要。
+- 保存本轮校验后的意图，未提供结果时不沿用旧轮次。
 """
 
 from typing import Literal
 from pydantic import BaseModel, ConfigDict
+from src.contracts.perception import IntentEstimate
 
 
 class InteractionState(BaseModel):
@@ -29,3 +31,4 @@ class SocialState(BaseModel):
     as_of_ms: int
     interaction: InteractionState
     committed_text: str | None = None
+    intent: IntentEstimate | None = None

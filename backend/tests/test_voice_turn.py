@@ -5,6 +5,7 @@
 - 确认短暂停顿中的 final 只合并一次，空结果不提交。
 - 验证 WebSocket partial 不调用 Agent，轮次完成后才调用。
 - 验证语音或文字轮次后的 TTS 语段编码仍可发送。
+- 通过本地分类替身隔离外部 LLM 请求，保持提交边界测试确定性。
 """
 
 import json
@@ -12,10 +13,12 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
 from src.main import create_app
+from src.contracts.perception import IntentEstimate
 from src.speech.frontend import validate_frame
 from src.turn.half_duplex import HalfDuplexTurn
 
@@ -73,6 +76,9 @@ class VoiceTurnTests(unittest.TestCase):
         app = create_app()
         app.state.speech_service = FakeSpeechService()
         app.state.agent = FakeAgent()
+        app.state.intent_service.classify = AsyncMock(return_value=IntentEstimate(
+            intent="chat", slots=[], confidence=0.9, needs_clarification=False,
+            missing_slots=[], control_action=None))
         with TestClient(app) as client:
             session_id = client.post("/v1/sessions").json()["session_id"]
             with client.websocket_connect(f"/v1/sessions/{session_id}/realtime") as ws:
@@ -131,6 +137,9 @@ class VoiceTurnTests(unittest.TestCase):
         app.state.settings = SimpleNamespace(llm_ready=True, tts_ready=True)
         app.state.agent = FakeAgent()
         app.state.tts = FakeTTS()
+        app.state.intent_service.classify = AsyncMock(return_value=IntentEstimate(
+            intent="chat", slots=[], confidence=0.9, needs_clarification=False,
+            missing_slots=[], control_action=None))
         with TestClient(app) as client:
             session_id = client.post("/v1/sessions").json()["session_id"]
             with client.websocket_connect(f"/v1/sessions/{session_id}/realtime") as ws:

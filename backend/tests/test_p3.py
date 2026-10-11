@@ -5,6 +5,7 @@
 - 验证慢 ASR final 不阻塞 VAD，乱序 final 保持原片段顺序。
 - 通过真实网关协程验证持续轮次、取消、停止确认和迟到 TTS。
 - 验证输出背压、故障降级、恢复上下文和确定性回放。
+- 为网关注入本地意图替身，避免实时控制测试调用外部模型。
 """
 
 import asyncio
@@ -13,9 +14,11 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import AsyncMock
 
 from src.agent.graph import AgentGraph
 from src.agent.recovery import control_action
+from src.contracts.perception import IntentEstimate
 from src.api.realtime import realtime
 from src.evaluation.trace import replay_turn
 from src.gateway.sessions import Session, SessionRegistry
@@ -381,6 +384,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.agent = RecordingAgent()
         self.app = SimpleNamespace(state=SimpleNamespace(
             sessions=registry, agent=self.agent, tts=FakeTTS(), speech_service=FakeSpeech(),
+            intent_service=SimpleNamespace(classify=AsyncMock(return_value=IntentEstimate(
+                intent="chat", slots=[], confidence=0.9, needs_clarification=False,
+                missing_slots=[], control_action=None))),
             settings=SimpleNamespace(llm_ready=True, tts_ready=True, stop_ack_timeout_ms=500)))
         self.ws = FakeSocket(self.app, self.session)
         self.task = asyncio.create_task(realtime(self.ws, self.session.session_id))

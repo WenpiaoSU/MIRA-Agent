@@ -5,6 +5,8 @@
 - 判断流式语言模型调用所需配置是否完整。
 - 从环境变量读取 TTS URL、Key、模型名、音色和可选情感标签映射。
 - 从环境变量读取 ASR 配置与 P3 轮次、停止确认及缓冲预算。
+- 读取意图识别的独立总超时，分类复用现有 LLM 配置。
+- 读取默认时间时区、工具总超时及固定天气来源的启用开关。
 """
 
 from dataclasses import dataclass
@@ -23,6 +25,10 @@ class Settings:
     llm_url: str = getenv("MIRA_LLM_URL", "").strip()
     llm_key: str = getenv("MIRA_LLM_KEY", "").strip()
     llm_model_name: str = getenv("MIRA_LLM_MODEL_NAME", "").strip()
+    intent_timeout_ms: int = max(100, int(getenv("MIRA_INTENT_TIMEOUT_MS", "10000")))
+    tool_timeout_ms: int = max(100, int(getenv("MIRA_TOOL_TIMEOUT_MS", "5000")))
+    default_timezone: str = getenv("MIRA_DEFAULT_TIMEZONE", "Asia/Shanghai").strip()
+    weather_enabled: bool = getenv("MIRA_WEATHER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     asr_url: str = getenv("MIRA_ASR_URL", "").strip()
     asr_key: str = getenv("MIRA_ASR_KEY", "").strip()
     asr_model_name: str = getenv("MIRA_ASR_MODEL_NAME", "").strip()

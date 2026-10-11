@@ -5,6 +5,8 @@
 - 分离生成计划、字幕展示、音频播放和输出失败。
 - 取消任务时保存中断快照，迟到回执只更新所属旧输出。
 - 提供冻结社会状态及脱敏轨迹，不让存储阻塞停止链路。
+- 将当前轮次的意图显式加入快照，不保存跨轮次的隐式意图。
+- 保存一个待澄清工具请求和有界结果账本，控制请求不重新执行查询。
 """
 
 import asyncio
@@ -14,6 +16,8 @@ from uuid import uuid4
 
 from src.contracts.output import InterruptionState, OutputRecord, SegmentDelivery
 from src.contracts.state import SocialState
+from src.contracts.perception import IntentEstimate
+from src.contracts.tools import PendingClarification
 from src.evaluation.trace import TraceRecorder, now_ms
 from src.turn.manager import TurnManager
 
@@ -31,6 +35,7 @@ class Session:
     generation_id: str | None = None
     outputs: OrderedDict[str, OutputRecord] = field(default_factory=OrderedDict)
     interruption: InterruptionState | None = None
+    pending_clarification: PendingClarification | None = None
     turn: TurnManager = field(default_factory=TurnManager)
     trace: TraceRecorder = field(default_factory=TraceRecorder)
     last_playback_at_ms: int = 0
@@ -189,6 +194,7 @@ class Session:
             spoken_text="".join(spoken), displayed_text="".join(displayed),
             remaining_text="".join(remaining), spoken_text_precision=precision,
             response_complete=record.response_complete, stop_confirmed=record.stop_confirmed,
+            completed_tool_call_ids=[record.tool_result.call_id] if record.tool_result and record.tool_result.verified else [],
             resume_allowed=record.cancel_reason not in {"disconnect", "takeover"})
 
     def finish_if_delivered(self) -> OutputRecord | None:
@@ -227,10 +233,11 @@ class Session:
         """提供由输出账本推导的兼容历史读取接口。"""
         return self.context_history()
 
-    def social_snapshot(self, text: str | None = None) -> SocialState:
-        """冻结最小社会状态，供本轮 Agent 读取而不共享可变对象。"""
+    def social_snapshot(self, text: str | None = None, intent: IntentEstimate | None = None) -> SocialState:
+        """冻结本轮文本与意图；没有新识别结果时意图为空。"""
         return SocialState(session_id=self.session_id, version=self.turn.version,
-                           as_of_ms=now_ms(), interaction=self.turn.snapshot(), committed_text=text)
+                           as_of_ms=now_ms(), interaction=self.turn.snapshot(), committed_text=text,
+                           intent=intent.model_copy(deep=True) if intent else None)
 
 
 class SessionRegistry:

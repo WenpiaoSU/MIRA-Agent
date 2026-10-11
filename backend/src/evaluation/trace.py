@@ -4,6 +4,8 @@
 - 使用共享 trace_id、因果事件 ID 和单调时间记录有界轨迹。
 - 汇总取消到停止确认耗时，不混用客户端与服务端时钟。
 - 用录制事件回放轮次状态机，不执行模型或外部工具。
+- 记录意图枚举、分类耗时与澄清状态，不保留槽位和用户正文。
+- 记录工具名称、调用标识、验证状态与安全错误码，不保留参数或结果正文。
 """
 
 from collections import deque
@@ -19,16 +21,17 @@ def now_ms() -> int:
 
 @dataclass
 class TraceRecorder:
-    """仅保留控制元数据；不保存密钥、原始音频或完整正文。"""
+    """仅保留控制及分类元数据；不保存密钥、原始音频或完整正文。"""
     events: deque = field(default_factory=lambda: deque(maxlen=2048))
 
     def record(self, event_type: str, trace_id: str, payload: dict,
                causation_id: str | None = None) -> None:
-        """筛选可回放的控制字段，记录事件与本机接收时间。"""
+        """筛选控制与分类元数据，记录事件与本机接收时间。"""
         allowed = {"generation_id", "segment_id", "state", "phase", "start_ms", "end_ms",
                    "p_speech", "echo_likelihood", "clipping_ratio", "aec_mode", "continuous",
                    "reason", "played_ms", "clock_ms", "command_id", "status", "elapsed_ms",
-                   "stop_elapsed_ms", "speech_to_stop_ms"}
+                   "stop_elapsed_ms", "speech_to_stop_ms", "intent", "confidence", "needs_clarification",
+                   "tool_name", "call_id", "verified", "error_code"}
         self.events.append({"type": event_type, "trace_id": trace_id,
                             "causation_id": causation_id, "server_ms": now_ms(),
                             "payload": {key: value for key, value in payload.items() if key in allowed}})
