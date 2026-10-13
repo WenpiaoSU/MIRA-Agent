@@ -3,6 +3,7 @@
 当前功能：
 - 格式化时间、当前天气和逐日预报，保留时区、时间与来源。
 - 失败仅展示安全错误；重复或继续只复述原结果，不重新查询。
+- 格式化本地时间转换和日期偏移结果。
 """
 
 from datetime import datetime
@@ -10,6 +11,7 @@ from datetime import datetime
 from src.contracts.tools import ToolResult
 from src.tools.builtin.time import TimeData
 from src.tools.builtin.weather import WeatherData
+from src.tools.builtin.datetime import ConvertedTime
 
 
 def render_tool_result(result: ToolResult) -> str:
@@ -30,4 +32,7 @@ def render_tool_result(result: ToolResult) -> str:
         return (f"{data.location} {forecast.date} 的预报为{forecast.condition}，"
                 f"气温 {forecast.temperature_min:g}～{forecast.temperature_max:g}{data.units}。"
                 f"来源：{data.source}；查询时间：{datetime.fromisoformat(data.fetched_at):%Y-%m-%d %H:%M} UTC。")
+    if result.tool_name == "convert_datetime":
+        data = ConvertedTime.model_validate(result.data)
+        return f"转换后的时间为 {data.iso_time}（{data.timezone}），当地日期为 {data.date}。"
     return "查询已完成，但当前没有这项工具的结果展示模板。"

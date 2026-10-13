@@ -6,11 +6,13 @@
 - 注入通过 API Key 调用的 TTS 适配器。
 - 注入本地 SileroVAD 与 ASR API 组成的语音服务。
 - 装配有界意图识别、时间工具及可关闭的单一来源天气工具。
+- 注入有界任务规划与时间转换工具，支持不同工具之间的字段依赖。
 """
 
 from fastapi import FastAPI
 
 from src.agent.graph import AgentGraph
+from src.agent.planner import TaskPlanner
 from src.api import health, realtime, sessions
 from src.core.config import Settings
 from src.gateway.sessions import SessionRegistry
@@ -22,6 +24,7 @@ from src.tools.registry import ToolRegistry
 from src.tools.executor import ToolExecutor
 from src.tools.builtin.time import CurrentTimeTool, TIME_SPEC
 from src.tools.builtin.weather import WeatherTool, WEATHER_SPEC
+from src.tools.builtin.datetime import convert_datetime, DATETIME_SPEC
 
 
 def create_app() -> FastAPI:
@@ -33,11 +36,13 @@ def create_app() -> FastAPI:
     provider = ChatCompletionsProvider(settings)
     registry = ToolRegistry()
     registry.register(TIME_SPEC, CurrentTimeTool(settings.default_timezone))
+    registry.register(DATETIME_SPEC, convert_datetime)
     if settings.weather_enabled:
         registry.register(WEATHER_SPEC, WeatherTool())
     app.state.tool_registry = registry
     app.state.tool_executor = ToolExecutor(registry, settings.tool_timeout_ms)
-    app.state.agent = AgentGraph(provider, app.state.tool_executor)
+    app.state.task_planner = TaskPlanner(provider, settings.plan_max_steps, settings.plan_timeout_ms)
+    app.state.agent = AgentGraph(provider, app.state.tool_executor, app.state.task_planner)
     app.state.intent_service = IntentService(provider, settings.intent_timeout_ms)
     app.state.tts = SpeechAPIProvider(settings)
     app.state.speech_service = SpeechService(settings)

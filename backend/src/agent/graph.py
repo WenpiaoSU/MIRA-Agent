@@ -7,6 +7,7 @@
 - 按校验后的意图路由问答、记忆请求、工具请求、澄清与控制。
 - 对未开放能力使用确定性说明，避免模型虚构操作成功。
 - 执行单个已注册工具、保存待澄清参数，并以已验证事实生成回复。
+- 在同一图中规划并执行有界依赖任务，跨轮保留结果和参数澄清。
 """
 
 import json
@@ -21,7 +22,9 @@ from langgraph.graph import END, START, StateGraph
 from src.agent.cue_parser import AvatarCueParser
 from src.agent.recovery import control_action, recovery_instruction
 from src.agent.tool_response import render_tool_result
-from src.contracts.agent import ResponsePlan, TextSegment
+from src.agent.planner import TaskPlanner, PlanError
+from src.agent.plan_execution import PlanExecution, current_step, facts_text
+from src.contracts.agent import ResponsePlan, TextSegment, TaskPlan
 from src.contracts.behavior import AvatarCue
 from src.contracts.perception import IntentEstimate
 from src.contracts.tools import PendingClarification, ToolCallRequest, ToolResult
@@ -77,15 +80,20 @@ class AgentState(TypedDict, total=False):
     route_instruction: str
     fixed_response: str
     speech_act: str
+    task_plan: TaskPlan | None
+    deadline_at: datetime
 
 
 class AgentGraph:
     """通过同一个图连接意图路由、恢复、上下文与流式生成。"""
 
-    def __init__(self, provider: ChatCompletionsProvider, tool_executor: ToolExecutor | None = None):
+    def __init__(self, provider: ChatCompletionsProvider, tool_executor: ToolExecutor | None = None,
+                 task_planner: TaskPlanner | None = None):
         """注入语言模型，编译意图分支与共享输出链路。"""
         self.provider = provider
         self.tool_executor = tool_executor
+        self.task_planner = task_planner or (TaskPlanner(provider) if tool_executor else None)
+        self.plan_execution = PlanExecution(tool_executor) if tool_executor else None
         builder = StateGraph(AgentState)
         builder.add_node("recovery_decision", self.recovery_decision)
         builder.add_node("prepare_context", self.prepare_context)
@@ -97,10 +105,17 @@ class AgentGraph:
         builder.add_node("clarify", self.clarify)
         builder.add_node("control", self.control)
         builder.add_node("finish_control", self.finish_control)
+        builder.add_node("plan", self.plan)
+        builder.add_node("execute_step", self.execute_step)
+        builder.add_node("plan_response", self.plan_response)
         builder.add_edge(START, "recovery_decision")
         builder.add_conditional_edges("recovery_decision", self.route_intent,
                                       {name: name for name in ("dialogue", "memory_query", "memory_update",
-                                                               "tool_request", "clarify", "control", "finish_control")})
+                                                               "tool_request", "clarify", "control", "finish_control", "plan")})
+        for name in ("plan", "execute_step"):
+            builder.add_conditional_edges(name, self.route_plan,
+                                          {route: route for route in ("execute_step", "plan_response", "prepare_context")})
+        builder.add_edge("plan_response", "prepare_context")
         for name in ("dialogue", "memory_query", "memory_update", "tool_request", "clarify", "control"):
             builder.add_edge(name, "prepare_context")
         builder.add_edge("finish_control", END)
@@ -123,6 +138,8 @@ class AgentGraph:
         intent = state.get("intent")
         if intent is None:
             return "control" if state["recovery_action"] != "respond" else "dialogue"
+        if intent.needs_planning:
+            return "plan"
         if intent.intent == "tool_request":
             return "tool_request"
         if intent.needs_clarification or intent.intent == "other":
@@ -132,6 +149,71 @@ class AgentGraph:
         if intent.intent in {"chat", "question"}:
             return "dialogue"
         return intent.intent
+
+    async def plan(self, state: AgentState) -> dict:
+        """生成新计划或补充原计划；整个计划校验后再进入执行循环。"""
+        if not self.task_planner or not self.plan_execution:
+            return {"task_plan": None, "fixed_response": "当前未开放多步任务执行能力。"}
+        writer = get_stream_writer()
+        try:
+            intent = state["intent"]
+            runtime = state["runtime_context"]
+            if intent.continues_pending:
+                raw_plan = runtime.get("active_plan")
+                raw_pending = runtime.get("pending_clarification")
+                if not raw_plan or not raw_pending:
+                    raise ValueError("原任务不存在")
+                plan = TaskPlan.model_validate(raw_plan).model_copy(deep=True)
+                self.plan_execution.supplement(plan, PendingClarification.model_validate(raw_pending), intent)
+            else:
+                context = "\n".join(message["content"] for message in state["history"][-6:])[:3000]
+                plan = await self.task_planner.plan(state["user_text"], context, self.tool_executor.registry.list_tools(),
+                                                    state["deadline_at"])
+                plan.status = "running"
+            self.plan_execution.publish(writer, plan)
+            question = self.plan_execution.preflight(writer, plan)
+            return {"task_plan": plan, **({"fixed_response": question, "speech_act": "clarify"} if question else {})}
+        except PlanError as exc:
+            return {"task_plan": None, "fixed_response": str(exc), "speech_act": "clarify"}
+        except ValueError:
+            return {"task_plan": None, "fixed_response": "无法补充原任务，请完整说明希望完成的目标。", "speech_act": "clarify"}
+
+    @staticmethod
+    def route_plan(state: AgentState) -> str:
+        """按已验证状态推进有限顺序列表；澄清和失败立即结束执行循环。"""
+        plan = state.get("task_plan")
+        if plan is None or plan.status != "running":
+            return "prepare_context"
+        step = current_step(plan)
+        return "execute_step" if step and step.kind == "tool" else "plan_response"
+
+    async def execute_step(self, state: AgentState) -> dict:
+        """执行一个工具步骤，循环次数受计划长度约束，不重新生成计划。"""
+        plan = state["task_plan"]
+        reply = await self.plan_execution.execute(get_stream_writer(), plan, state["deadline_at"])
+        updates = {"task_plan": plan}
+        if reply:
+            updates["fixed_response"] = reply
+            if plan.status == "waiting_input":
+                updates["speech_act"] = "clarify"
+        return updates
+
+    async def plan_response(self, state: AgentState) -> dict:
+        """先展示固定事实，再生成一次综合建议；回复失败不伪报整个任务完成。"""
+        plan = state["task_plan"]
+        step = current_step(plan)
+        verified = facts_text(plan)
+        try:
+            advice = await self.task_planner.answer(plan, state["deadline_at"])
+            plan.response_text = verified + "\n综合回答：" + advice
+            step.status = "succeeded"
+            plan.status = "completed"
+        except PlanError as exc:
+            step.status = "failed"
+            plan.status = "failed"
+            plan.response_text = verified + "\n" + str(exc)
+        self.plan_execution.publish(get_stream_writer(), plan)
+        return {"task_plan": plan, "fixed_response": plan.response_text}
 
     @staticmethod
     def dialogue(state: AgentState) -> dict:
@@ -229,6 +311,18 @@ class AgentGraph:
         """继续使用句子级恢复约束，换话题时不延续旧任务。"""
         runtime = state.get("runtime_context", {})
         raw_result = runtime.get("interrupted_tool_result")
+        raw_plan = runtime.get("interrupted_plan")
+        if raw_plan and state["recovery_action"] in {"resume", "repeat"}:
+            plan = TaskPlan.model_validate(raw_plan)
+            snapshot = runtime.get("interruption_state") or {}
+            if not snapshot.get("resume_allowed", True):
+                return {"fixed_response": "旧连接的任务已停止，请重新说明当前请求。"}
+            reply = plan.response_text or (facts_text(plan) + "\n原任务已停止，未继续执行剩余步骤。")
+            if state["recovery_action"] == "resume" and snapshot.get("response_complete"):
+                if snapshot.get("spoken_text") == reply:
+                    return {"fixed_response": "刚才的任务结果已经完整播报。"}
+                reply = snapshot.get("remaining_text") or reply
+            return {"fixed_response": reply}
         if raw_result and state["recovery_action"] in {"resume", "repeat"}:
             snapshot = runtime.get("interruption_state") or {}
             if not snapshot.get("resume_allowed", True):
@@ -334,7 +428,9 @@ class AgentGraph:
         raw_intent = runtime.get("social_state", {}).get("intent")
         intent = IntentEstimate.model_validate(raw_intent) if raw_intent is not None else None
         state: AgentState = {"user_text": user_text, "history": history, "recent_avatar_cues": recent_avatar_cues,
-                             "generation_id": generation_id, "runtime_context": runtime, "intent": intent}
+                             "generation_id": generation_id, "runtime_context": runtime, "intent": intent,
+                             "deadline_at": datetime.fromisoformat(runtime["generation_deadline_at"])
+                             if runtime.get("generation_deadline_at") else datetime.now(timezone.utc) + timedelta(seconds=120)}
         async for part in self.graph.astream(state, stream_mode=["custom", "updates"]):
             mode, data = part
             if mode == "custom":

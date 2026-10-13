@@ -4,6 +4,7 @@
 - 保存双向 JSON Schema，并禁止校验时加载外部引用。
 - 约束一次只读调用的截止时间、验证结果和安全错误。
 - 保存每个会话最多一个待补充的工具请求。
+- 为计划内的澄清请求保存任务与步骤归属。
 """
 
 from datetime import datetime
@@ -103,3 +104,12 @@ class PendingClarification(BaseModel):
     arguments: dict[str, JsonValue]
     missing_slots: list[str]
     question: str
+    plan_id: str | None = None
+    step_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_plan_binding(self) -> Self:
+        """计划归属必须成对提供，普通单工具澄清保留空值。"""
+        if (self.plan_id is None) != (self.step_id is None):
+            raise ValueError("澄清任务和步骤标识必须同时提供")
+        return self

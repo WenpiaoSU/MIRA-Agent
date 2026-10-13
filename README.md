@@ -15,6 +15,7 @@ MIRA-Agent 是一个支持文字与语音对话的 Live2D 交互应用。浏览�
 - 会话管理、健康检查、控制轨迹查看与离线回放。
 - 已提交轮次的七类意图识别、槽位校验与 Agent 分支路由；失败时澄清，未开放能力给出明确说明。
 - 基础只读工具：当前时间、Open-Meteo 当前天气与七天内逐日预报；支持跨轮次补充参数及结果验证。
+- 轻量任务规划：默认最多 6 步，支持不同工具配合、前序结果传参及跨轮补参；时间转换与日期计算在本地工具中完成。
 
 当前会话、待澄清请求和工具结果保存在后端进程内，服务重启后清空。视觉输入、长期记忆、提醒、MCP 和用户账户尚未接入。语音恢复采用句子级精度；真实设备的 AEC 效果与停止延迟需要实测。天气固定使用 Open-Meteo，无需 API Key；地点重名时先询问省份或国家。
 
@@ -116,7 +117,7 @@ npm ci
 | `MIRA_LLM_URL` | 完整的 Chat Completions POST 地址，包括接口路径 |
 | `MIRA_LLM_KEY` | 接口密钥，以 Bearer 认证发送 |
 | `MIRA_LLM_MODEL_NAME` | 服务端接受的模型名称 |
-| `MIRA_INTENT_TIMEOUT_MS` | 意图分类总超时，默认 10000 毫秒，超时进入澄清 |
+| `MIRA_INTENT_TIMEOUT_MS` | 意图分类总超时，默认 30000 毫秒；复杂任务实测曾约 20 秒，超时进入澄清 |
 
 服务需接收 `model`、`messages`、`stream=true`，通过 SSE 返回 `choices[0].delta.content`，可用 `[DONE]` 结束流。配置完整表示具备调用条件，健康接口不会自动验证密钥或服务端模型是否有效。
 
@@ -128,9 +129,13 @@ npm ci
 | --- | --- |
 | `MIRA_DEFAULT_TIMEZONE` | IANA 默认时区，默认 `Asia/Shanghai` |
 | `MIRA_TOOL_TIMEOUT_MS` | 每次查询总预算，默认 5000 毫秒，包含天气地点检索 |
+| `MIRA_PLAN_MAX_STEPS` | 计划总步骤，默认 6，范围 2–12，包含最后回答步骤 |
+| `MIRA_PLAN_TIMEOUT_MS` | 规划和综合回复各自的模型总超时，默认 15000 毫秒；同时受整轮剩余预算限制 |
 | `MIRA_WEATHER_ENABLED` | 默认 `true`；关闭时天气不进入工具目录 |
 
 天气固定使用 Open-Meteo，无需密钥。可以尝试“现在几点？”或“查杭州, 浙江明天的天气”；“查明天天气”会先问地点，再接收下一轮补充。工具成功后直接输出已验证事实；“继续／重复”不会重新查询。见 [基础工具实现](docs/tools-implementation.md)。
+
+组合任务可以尝试：“查询 UTC 当前时间，转换为 Asia/Shanghai 的明天日期，查杭州, 浙江该日期天气，再查天气地点现在几点，最后给穿衣建议。”计划通过前序字段引用串联 `get_current_time → convert_datetime → get_weather → get_current_time → respond`，不限定两次查询。缺参时保存整个任务，补充后跳过成功步骤；失败停止后续调用，取消后不会自动继续工具操作。见 [任务规划实现](docs/planning-implementation.md)。
 
 ### ASR：语音输入必需
 

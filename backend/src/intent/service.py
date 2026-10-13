@@ -5,6 +5,7 @@
 - 校验工具目录、参数类型、必填字段及原文证据。
 - 为分类设置总超时和输出上限，失败时澄清，取消时立即退出。
 - 在有限预算内整理近期交付上下文，不读取 ASR 置信度。
+- 将有顺序、依赖或综合目标的多步工具任务交给任务规划，继续原计划的参数补充。
 """
 
 import asyncio
@@ -48,6 +49,16 @@ confidence 是可为空的自评，不代表事实可信度、权限或操作已
 pending_clarification 是正在等待用户补充的单个工具请求。用户补充其参数时，选择原工具并令 continues_pending=true，
 slots 只填写本轮明确提供或纠正的参数，已有参数由服务端合并。例如等待天气地点时回答“杭州, 浙江”属于补充。
 独立的新请求、换任务或普通交流令 continues_pending=false，不从待澄清请求继承地点或日期。
+needs_planning=true 用于多工具配合、同工具多次查询后比较、查询后给建议、时间/日期转换后继续查询等组合目标。
+这些请求仍属于 tool_request；不要因包含不同步骤就归 other。用户明确的顺序或共同目标足够时直接标记规划。
+新的规划请求必须 slots=[]、tool_intent=null、missing_slots=[]、needs_clarification=false；
+不要在分类结果里拆步骤或把多工具参数混在扁平 slots 中，缺项由规划器逐步检查。
+简单单次查询 needs_planning=false。pending_clarification 含 plan_id 时，补充请求必须令 needs_planning=true，
+并选择待补充步骤的 tool_name；slots 只提取本轮补充参数。不要在用户补参时重新拆解原任务。
+新的多工具组合请求的输出格式示例：
+{"intent":"tool_request","slots":[],"confidence":0.9,"tool_intent":null,"needs_clarification":false,
+"missing_slots":[],"control_action":null,"continues_pending":false,"needs_planning":true}
+示例只定义字段格式，不代表每个请求都需要规划；简单查询和控制按原规则识别。
 """
 
 
@@ -96,7 +107,7 @@ def unwrap_json(raw: str) -> str:
 class IntentService:
     """完成一次有界分类，不修改会话、不执行外部操作。"""
 
-    def __init__(self, provider: IntentLLMProvider, timeout_ms: int = 10000):
+    def __init__(self, provider: IntentLLMProvider, timeout_ms: int = 30000):
         """注入现有模型适配器并设置分类总预算。"""
         if timeout_ms <= 0:
             raise ValueError("分类超时必须为正数")
@@ -140,6 +151,8 @@ class IntentService:
                 if estimate.continues_pending and (pending_clarification is None or
                                                    estimate.tool_intent != pending_clarification.tool_name):
                     raise ValueError("不存在对应待澄清任务")
+                if estimate.continues_pending and pending_clarification.plan_id:
+                    estimate = estimate.model_copy(update={"needs_planning": True})
                 return self.validate_estimate(estimate, committed_text, evidence_context, tools)
         except TimeoutError:
             logger.warning("意图识别降级：timeout")
@@ -180,6 +193,8 @@ class IntentService:
         tool = tools.get(estimate.tool_intent)
         if tool is None:
             raise ValueError("工具不在可调用目录中")
+        if estimate.needs_planning:
+            return estimate
         properties = tool.input_schema.get("properties", {})
         required = tool.input_schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):

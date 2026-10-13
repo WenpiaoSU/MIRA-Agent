@@ -7,6 +7,7 @@
 - 从环境变量读取 ASR 配置与 P3 轮次、停止确认及缓冲预算。
 - 读取意图识别的独立总超时，分类复用现有 LLM 配置。
 - 读取默认时间时区、工具总超时及固定天气来源的启用开关。
+- 读取规划步骤上限与规划/综合回复的独立模型预算。
 """
 
 from dataclasses import dataclass
@@ -25,8 +26,10 @@ class Settings:
     llm_url: str = getenv("MIRA_LLM_URL", "").strip()
     llm_key: str = getenv("MIRA_LLM_KEY", "").strip()
     llm_model_name: str = getenv("MIRA_LLM_MODEL_NAME", "").strip()
-    intent_timeout_ms: int = max(100, int(getenv("MIRA_INTENT_TIMEOUT_MS", "10000")))
+    intent_timeout_ms: int = max(100, int(getenv("MIRA_INTENT_TIMEOUT_MS", "30000")))
     tool_timeout_ms: int = max(100, int(getenv("MIRA_TOOL_TIMEOUT_MS", "5000")))
+    plan_max_steps: int = max(2, min(12, int(getenv("MIRA_PLAN_MAX_STEPS", "6"))))
+    plan_timeout_ms: int = max(100, int(getenv("MIRA_PLAN_TIMEOUT_MS", "15000")))
     default_timezone: str = getenv("MIRA_DEFAULT_TIMEZONE", "Asia/Shanghai").strip()
     weather_enabled: bool = getenv("MIRA_WEATHER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     asr_url: str = getenv("MIRA_ASR_URL", "").strip()

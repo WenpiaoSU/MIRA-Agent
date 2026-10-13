@@ -8,11 +8,13 @@
 - 在断线、接管、超时及会话删除时回收全部连接任务。
 - 在可取消的生成任务中识别最终意图，冻结结果后交给现有 Agent 路由。
 - 提供真实工具目录、保存会话参数澄清及结果，过滤取消后的旧工具事件。
+- 原子保存计划与跨轮澄清，管理多步结果和任务恢复，沿用整轮截止时间。
 """
 
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -24,6 +26,7 @@ from src.contracts.realtime import (
     PlaybackInput, StopInput, TextInput,
 )
 from src.contracts.tools import PendingClarification, ToolResult
+from src.contracts.agent import TaskPlan
 from src.evaluation.trace import now_ms
 from src.gateway.sender import EventSender
 from src.intent.service import build_context_summary
@@ -124,7 +127,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                        record.turn_id, record.generation_id)
             await send_state(record.turn_id)
 
-    async def generate(text, turn_id, generation_id, source):
+    async def generate(text, turn_id, generation_id, source, deadline_at):
         """在可取消任务内完成分类与生成，不阻塞网关接收和 VAD。"""
         coordinator = None
         try:
@@ -153,10 +156,12 @@ async def realtime(websocket: WebSocket, session_id: str):
             record = session.outputs[generation_id]
             # 分类降级时保留原待澄清请求；独立的新任务和控制请求清除它。
             if not intent.continues_pending and not (intent.intent == "other" and intent.confidence is None):
+                session.cancel_plan()
                 session.pending_clarification = None
             session.trace.record("intent.classified", record.trace_id,
                                  {"generation_id": generation_id, "intent": intent.intent,
                                   "confidence": intent.confidence, "needs_clarification": intent.needs_clarification,
+                                  "needs_planning": intent.needs_planning,
                                   "elapsed_ms": now_ms() - started_ms})
             if intent.intent == "control" and not intent.needs_clarification:
                 if intent.control_action == "change_topic":
@@ -169,9 +174,16 @@ async def realtime(websocket: WebSocket, session_id: str):
                         session.interruption = session.snapshot_interruption(previous[-1])
             runtime_context = {"social_state": session.social_snapshot(text, intent).model_dump(),
                                "interruption_state": session.interruption.model_dump() if session.interruption else None,
-                               "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None}
+                               "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None,
+                               "active_plan": session.active_plan.model_dump(mode="json") if session.active_plan and intent.continues_pending else None,
+                               "generation_deadline_at": deadline_at.isoformat()}
             if session.interruption:
                 interrupted_record = session.outputs.get(session.interruption.generation_id)
+                if interrupted_record and interrupted_record.task_plan:
+                    runtime_context["interrupted_plan"] = interrupted_record.task_plan.model_dump(mode="json")
+                    if intent.intent == "control" and intent.control_action in {"repeat", "resume"}:
+                        record.task_plan = interrupted_record.task_plan.model_copy(deep=True)
+                        record.tool_results = [result.model_copy(deep=True) for result in interrupted_record.tool_results]
                 if interrupted_record and interrupted_record.tool_result:
                     runtime_context["interrupted_tool_result"] = interrupted_record.tool_result.model_dump(mode="json")
                     if intent.intent == "control" and intent.control_action in {"repeat", "resume"}:
@@ -191,6 +203,19 @@ async def realtime(websocket: WebSocket, session_id: str):
                 if session.generation_id != generation_id or session.connection_epoch != epoch:
                     return
                 kind, payload = item["type"], item["payload"]
+                if kind == "plan.updated":
+                    plan = TaskPlan.model_validate(payload["plan"])
+                    record.task_plan = plan.model_copy(deep=True)
+                    session.active_plan = plan.model_copy(deep=True) if plan.status in {"running", "waiting_input"} else None
+                    session.pending_clarification = (PendingClarification.model_validate(payload["pending"])
+                                                     if payload.get("pending") else None)
+                    for step in plan.steps:
+                        if step.result and not any(result.call_id == step.result.call_id for result in record.tool_results):
+                            record.tool_results.append(step.result.model_copy(deep=True))
+                    session.trace.record(kind, record.trace_id, {"generation_id": generation_id,
+                                         "task_plan_id": plan.plan_id, "status": plan.status,
+                                         "step_count": len(plan.steps)})
+                    continue
                 if kind == "tool.pending":
                     session.pending_clarification = (PendingClarification.model_validate(payload["pending"])
                                                      if payload["pending"] else None)
@@ -198,10 +223,13 @@ async def realtime(websocket: WebSocket, session_id: str):
                 if kind == "tool.result":
                     record.tool_result = ToolResult.model_validate(payload["result"])
                     result = record.tool_result
+                    if not any(item.call_id == result.call_id for item in record.tool_results):
+                        record.tool_results.append(result.model_copy(deep=True))
                     session.trace.record("tool.completed", record.trace_id,
                                          {"generation_id": generation_id, "call_id": result.call_id,
                                           "tool_name": result.tool_name, "status": result.status,
                                           "verified": result.verified, "elapsed_ms": result.elapsed_ms,
+                                          "task_plan_id": payload.get("task_plan_id"), "step_id": payload.get("step_id"),
                                           "error_code": result.error.code if result.error else None})
                     continue
                 if kind == "tool.started":
@@ -249,7 +277,8 @@ async def realtime(websocket: WebSocket, session_id: str):
         """为分类、生成与合成设置整轮预算，超时走同一取消协议。"""
         try:
             async with asyncio.timeout(getattr(settings, "generation_timeout_ms", 120000) / 1000):
-                await generate(text, turn_id, generation_id, source)
+                deadline_at = datetime.now(timezone.utc) + timedelta(milliseconds=getattr(settings, "generation_timeout_ms", 120000))
+                await generate(text, turn_id, generation_id, source, deadline_at)
         except TimeoutError:
             if session.connection_epoch == epoch and session.generation_id == generation_id:
                 await cancel("generation_timeout")
@@ -260,6 +289,7 @@ async def realtime(websocket: WebSocket, session_id: str):
         """保存最终输入，明确控制短句走快捷路径，其余进入同一个 Agent。"""
         action = control_action(text)
         if action == "stop":
+            session.cancel_plan()
             session.pending_clarification = None
             await cancel("user_stop")
             await send("turn.controlled", {"action": "stop"}, turn_id)
@@ -267,6 +297,7 @@ async def realtime(websocket: WebSocket, session_id: str):
             return
         await cancel("new_turn")
         if action == "change_topic":
+            session.cancel_plan()
             session.interruption = None
             session.pending_clarification = None
         if action == "repeat" and session.interruption is None and session.outputs:
@@ -449,6 +480,7 @@ async def realtime(websocket: WebSocket, session_id: str):
             elif kind == "control.stop":
                 target = payload.generation_id
                 if target is None or target == session.generation_id:
+                    session.cancel_plan()
                     session.pending_clarification = None
                     await cancel("user_stop")
                 elif target in session.outputs and session.outputs[target].status == "cancelled":
@@ -478,6 +510,7 @@ async def realtime(websocket: WebSocket, session_id: str):
         if audio_task and not audio_task.done():
             audio_task.cancel()
         if session.connection_epoch == epoch:
+            session.cancel_plan()
             session.pending_clarification = None
             task = session.generation_task
             session.cancel_generation("disconnect")

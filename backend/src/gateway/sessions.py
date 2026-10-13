@@ -7,6 +7,7 @@
 - 提供冻结社会状态及脱敏轨迹，不让存储阻塞停止链路。
 - 将当前轮次的意图显式加入快照，不保存跨轮次的隐式意图。
 - 保存一个待澄清工具请求和有界结果账本，控制请求不重新执行查询。
+- 保存一个活跃任务计划，并在取消或连接接管时终止剩余步骤。
 """
 
 import asyncio
@@ -18,6 +19,7 @@ from src.contracts.output import InterruptionState, OutputRecord, SegmentDeliver
 from src.contracts.state import SocialState
 from src.contracts.perception import IntentEstimate
 from src.contracts.tools import PendingClarification
+from src.contracts.agent import TaskPlan
 from src.evaluation.trace import TraceRecorder, now_ms
 from src.turn.manager import TurnManager
 
@@ -36,6 +38,7 @@ class Session:
     outputs: OrderedDict[str, OutputRecord] = field(default_factory=OrderedDict)
     interruption: InterruptionState | None = None
     pending_clarification: PendingClarification | None = None
+    active_plan: TaskPlan | None = None
     turn: TurnManager = field(default_factory=TurnManager)
     trace: TraceRecorder = field(default_factory=TraceRecorder)
     last_playback_at_ms: int = 0
@@ -68,6 +71,9 @@ class Session:
 
     def cancel_generation(self, reason: str = "user_stop") -> str | None:
         """立即失效并取消生成任务，保留账本以接收最终停止位置。"""
+        if self.active_plan and (self.active_plan.status == "running" or
+                                 reason in {"user_stop", "disconnect", "takeover", "generation_timeout", "change_topic"}):
+            self.cancel_plan()
         old = self.generation_id
         if old is None:
             return None
@@ -88,6 +94,26 @@ class Session:
         if task and not task.done() and task is not current_task:
             task.cancel()
         return old
+
+    def cancel_plan(self) -> None:
+        """结束未完成计划并保留成功结果；明确停止也清除尚未播报的澄清目标。"""
+        if self.active_plan:
+            plan = self.active_plan.model_copy(deep=True)
+            plan.status = "cancelled"
+            for step in plan.steps:
+                if step.status in {"pending", "running", "waiting_input"}:
+                    step.status = "cancelled"
+            for record in self.outputs.values():
+                if record.task_plan and record.task_plan.plan_id == plan.plan_id:
+                    # 历史输出保留当时的结果，不能把新轮次结果回填到旧 generation。
+                    snapshot = record.task_plan.model_copy(deep=True)
+                    snapshot.status = "cancelled"
+                    for step in snapshot.steps:
+                        if step.status in {"pending", "running", "waiting_input"}:
+                            step.status = "cancelled"
+                    record.task_plan = snapshot
+        self.active_plan = None
+        self.pending_clarification = None
 
     def cancel_payload(self, generation_id: str) -> dict:
         """构造幂等取消命令，同一输出重复发送使用原 command_id。"""
@@ -194,7 +220,9 @@ class Session:
             spoken_text="".join(spoken), displayed_text="".join(displayed),
             remaining_text="".join(remaining), spoken_text_precision=precision,
             response_complete=record.response_complete, stop_confirmed=record.stop_confirmed,
-            completed_tool_call_ids=[record.tool_result.call_id] if record.tool_result and record.tool_result.verified else [],
+            completed_tool_call_ids=list(dict.fromkeys(result.call_id for result in
+                                                       [*record.tool_results, *([record.tool_result] if record.tool_result else [])]
+                                                       if result.verified)),
             resume_allowed=record.cancel_reason not in {"disconnect", "takeover"})
 
     def finish_if_delivered(self) -> OutputRecord | None:

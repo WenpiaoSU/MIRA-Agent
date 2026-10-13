@@ -4,11 +4,13 @@
 - 区分文本展示、音频播放、取消确认及播放失败。
 - 保存带来源和精确度标志的中断快照。
 - 在输出账本保存单次工具结果，恢复时复述原事实而不重复执行。
+- 保存有界的多步结果和任务快照，取消后恢复只复述原事实。
 """
 
 from typing import Literal
 from pydantic import BaseModel, Field
 from src.contracts.tools import ToolResult
+from src.contracts.agent import TaskPlan
 
 
 class SegmentDelivery(BaseModel):
@@ -49,6 +51,8 @@ class OutputRecord(BaseModel):
     connection_epoch: int
     speech_enabled: bool
     tool_result: ToolResult | None = None
+    tool_results: list[ToolResult] = Field(default_factory=list, max_length=24)
+    task_plan: TaskPlan | None = None
     segments: dict[str, SegmentDelivery] = Field(default_factory=dict)
     response_complete: bool = False
     synthesis_complete: bool = False
