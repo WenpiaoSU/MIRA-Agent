@@ -5,6 +5,7 @@
  * - 在实际 AEC 可用时持续采集，无法启用时使用半双工。
  * - 同步停音、清动作并发送最终位置和取消执行回执。
  * - 以实际播放开始与媒体时钟驱动角色，断线后有界重连。
+ * - 记忆删除后清空本地对话正文和待展示缓存，保留当前删除确认的输出位置。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -206,6 +207,14 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
           if (event.connection_epoch !== connectionEpoch.current) return;
           serverSeq.current = event.seq;
           const generationId = event.generation_id;
+          if (event.type === 'memory.cleared') {
+            displayed.current.clear();
+            pendingDisplay.current.clear();
+            setTranscript('');
+            setMessages(activeTurnId.current ? [{ id: 'assistant:' + activeTurnId.current,
+              role: 'assistant', text: '', pending: true }] : []);
+            return;
+          }
           if (event.trace_id) traceId.current = event.trace_id;
           if (generationId && cancelled.current.has(generationId)
               && ['behavior.plan', 'response.segment', 'response.completed', 'tts.chunk'].includes(event.type)) return;

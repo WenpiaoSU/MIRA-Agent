@@ -16,8 +16,9 @@ MIRA-Agent 是一个支持文字与语音对话的 Live2D 交互应用。浏览�
 - 已提交轮次的七类意图识别、槽位校验与 Agent 分支路由；失败时澄清，未开放能力给出明确说明。
 - 基础只读工具：当前时间、Open-Meteo 当前天气与七天内逐日预报；支持跨轮次补充参数及结果验证。
 - 轻量任务规划：默认最多 6 步，支持不同工具配合、前序结果传参及跨轮补参；时间转换与日期计算在本地工具中完成。
+- 基础记忆：LangGraph Checkpointer 短期上下文、SQLite 长期事实/偏好，支持跨会话查询、更正和删除。
 
-当前会话、待澄清请求和工具结果保存在后端进程内，服务重启后清空。视觉输入、长期记忆、提醒、MCP 和用户账户尚未接入。语音恢复采用句子级精度；真实设备的 AEC 效果与停止延迟需要实测。天气固定使用 Open-Meteo，无需 API Key；地点重名时先询问省份或国家。
+当前会话、短期 Checkpointer、待澄清请求和工具结果保存在后端进程内，服务重启后清空。长期记忆保存在 SQLite，通过服务端签发的浏览器 Cookie 关联同一用户，新会话和后端重启后可继续查询；清除 Cookie 或换浏览器会建立新身份。视觉输入、提醒、MCP 和账户登录尚未接入。语音恢复采用句子级精度；真实设备的 AEC 效果与停止延迟需要实测。天气固定使用 Open-Meteo，无需 API Key；地点重名时先询问省份或国家。
 
 ## 系统结构
 
@@ -48,6 +49,7 @@ MIRA-Agent/
 │   │   ├── speech/、turn/      # VAD、ASR 与轮次控制
 │   │   ├── providers/          # LLM、TTS API 适配
 │   │   ├── intent/、tools/     # 意图识别、执行器与 builtin 时间/天气工具
+│   │   ├── memory/、repositories/ # 检查点记忆、候选门控与 SQLite 事务
 │   │   ├── expression/、output/ # 行为计划与语音输出协调
 │   │   └── evaluation/         # 控制轨迹与离线回放
 │   ├── tests/
@@ -137,7 +139,21 @@ npm ci
 
 组合任务可以尝试：“查询 UTC 当前时间，转换为 Asia/Shanghai 的明天日期，查杭州, 浙江该日期天气，再查天气地点现在几点，最后给穿衣建议。”计划通过前序字段引用串联 `get_current_time → convert_datetime → get_weather → get_current_time → respond`，不限定两次查询。缺参时保存整个任务，补充后跳过成功步骤；失败停止后续调用，取消后不会自动继续工具操作。见 [任务规划实现](docs/planning-implementation.md)。
 
+### 记忆
+
+默认启用基础记忆，无需额外数据库服务。长期数据位于 `backend/data/memory.sqlite3`，短期上下文使用 LangGraph 内存型 Checkpointer。
+
+| 变量 | 含义 |
+| --- | --- |
+| `MIRA_MEMORY_ENABLED` | 默认 `true`，关闭后新会话仅使用短期记忆 |
+| `MIRA_MEMORY_DB_PATH` | SQLite 文件路径；不设置时使用后端 `data/memory.sqlite3` |
+| `MIRA_MEMORY_TIMEOUT_MS` | 每次记忆候选提取的模型预算，默认 10000 毫秒 |
+| `MIRA_WORKING_MEMORY_TTL_SECONDS` | 短期上下文保留时间，默认 3600 秒 |
+
+可以依次尝试“我喜欢简短回答”“你记得我的回答风格吗”“现在把回答偏好改为详细解释”“忘掉我的回答偏好”。同一浏览器重新打开页面后可查询已保存事实。删除一个事实同时删除该事实的历史版本，并清空该用户各会话的上下文及显示，防止已忘内容被旧对话带回。查看与删除接口、边界见 [记忆实现说明](docs/memory-implementation.md)。
+
 ### ASR：语音输入必需
+
 
 | 变量 | 默认 | 含义 |
 | --- | --- | --- |

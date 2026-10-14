@@ -8,10 +8,12 @@
 - 将当前轮次的意图显式加入快照，不保存跨轮次的隐式意图。
 - 保存一个待澄清工具请求和有界结果账本，控制请求不重新执行查询。
 - 保存一个活跃任务计划，并在取消或连接接管时终止剩余步骤。
+- 按浏览器身份隔离长期记忆；删除后清除相关交付缓存并通知各连接。
 """
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -28,6 +30,10 @@ from src.turn.manager import TurnManager
 class Session:
     """保存单会话连接、输出代次与有界交付记录。"""
     session_id: str = field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
+    owner_token_hash: str | None = None
+    memory_notifications: list[dict] = field(default_factory=list)
+    invalidate_checkpoint: Callable[[str, str], None] | None = None
     connection_epoch: int = 0
     next_seq: int = 0
     last_client_seq: int = -1
@@ -83,6 +89,8 @@ class Session:
         record.cancel_command_id = str(uuid4())
         record.cancelled_at_ms = now_ms()
         self.generation_id = None
+        if self.invalidate_checkpoint:
+            self.invalidate_checkpoint(self.session_id, old)
         self.turn.cancel(old)
         self.interruption = self.snapshot_interruption(record)
         try:
@@ -243,18 +251,29 @@ class Session:
     def context_history(self, exclude_generation: str | None = None) -> list[dict[str, str]]:
         """仅使用交付事实构建近期上下文，并显式区分字幕与实际说出。"""
         messages = []
-        for record in self.outputs.values():
-            if record.generation_id == exclude_generation:
+        for turn in self.context_turns():
+            if turn["generation_id"] == exclude_generation:
                 continue
-            messages.append({"role": "user", "content": record.user_text})
+            if turn["user"]:
+                messages.append({"role": "user", "content": turn["user"]})
+            if turn["assistant"]:
+                messages.append({"role": "assistant", "content": turn["assistant"]})
+        return messages[-12:]
+
+    def context_turns(self) -> list[dict[str, str]]:
+        """提供可按 generation 合并的交付事实，由 Agent 同步到 Checkpointer。"""
+        turns = []
+        for record in self.outputs.values():
             displayed = "".join(segment.text for segment in record.segments.values() if segment.displayed)
             spoken = "".join(segment.text for segment in record.segments.values() if segment.playback == "ended")
+            content = ""
             if displayed or spoken:
                 content = displayed or spoken
                 if record.speech_enabled:
                     content += f"\n【交付记录：完整播完的句子={spoken or '无'}；状态={record.status}；字幕不等于已说出】"
-                messages.append({"role": "assistant", "content": content})
-        return messages[-12:]
+            turns.append({"generation_id": record.generation_id, "user": record.user_text, "assistant": content,
+                          "created_at": str(record.created_at)})
+        return turns
 
     @property
     def history(self) -> list[dict[str, str]]:
@@ -263,7 +282,7 @@ class Session:
 
     def social_snapshot(self, text: str | None = None, intent: IntentEstimate | None = None) -> SocialState:
         """冻结本轮文本与意图；没有新识别结果时意图为空。"""
-        return SocialState(session_id=self.session_id, version=self.turn.version,
+        return SocialState(session_id=self.session_id, user_id=self.user_id, version=self.turn.version,
                            as_of_ms=now_ms(), interaction=self.turn.snapshot(), committed_text=text,
                            intent=intent.model_copy(deep=True) if intent else None)
 
@@ -274,10 +293,13 @@ class SessionRegistry:
     def __init__(self):
         """初始化按会话标识索引的内存表。"""
         self.sessions: dict[str, Session] = {}
+        self.forget_checkpoint = None
+        self.invalidate_checkpoint = None
 
-    def create(self) -> Session:
-        """创建并登记一个匿名会话。"""
-        session = Session()
+    def create(self, user_id: str | None = None, owner_token_hash: str | None = None) -> Session:
+        """创建会话；用户归属由服务端验证后的浏览器凭据提供。"""
+        session = Session(user_id=user_id, owner_token_hash=owner_token_hash,
+                          invalidate_checkpoint=self.invalidate_checkpoint)
         self.sessions[session.session_id] = session
         return session
 
@@ -290,4 +312,32 @@ class SessionRegistry:
         session = self.sessions.pop(session_id, None)
         if session:
             session.cancel_generation("disconnect")
+            if self.forget_checkpoint:
+                self.forget_checkpoint(session_id)
+
+    def forget_memories(self, user_id: str, current_session: str = "", current_generation: str = ""):
+        """删除用户记忆后清理全部会话派生上下文，取消其他正在使用旧事实的输出。"""
+        for session in self.sessions.values():
+            if session.user_id != user_id:
+                continue
+            current = session.session_id == current_session and session.generation_id == current_generation
+            record = session.outputs.get(current_generation) if current else None
+            if not current:
+                old = session.cancel_generation("memory_deleted")
+                if old:
+                    session.memory_notifications.append({"type": "output.cancel", "payload": session.cancel_payload(old),
+                                                         "generation_id": old})
+            session.cancel_plan()
+            session.interruption = None
+            session.outputs.clear()
+            session.recent_avatar_cues.clear()
+            if record:
+                record.user_text = ""
+                record.tool_result = None
+                record.tool_results = []
+                record.task_plan = None
+                session.outputs[current_generation] = record
+            if self.forget_checkpoint:
+                self.forget_checkpoint(session.session_id)
+            session.memory_notifications.append({"type": "memory.cleared", "payload": {}, "generation_id": None})
 

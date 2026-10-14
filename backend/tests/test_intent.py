@@ -251,8 +251,8 @@ class IntentGraphTests(unittest.IsolatedAsyncioTestCase):
         """未开放能力不调用回复模型，也不生成操作成功或天气结果。"""
         cases = [(estimate("tool_request"), "外部工具"),
                  (estimate("memory_update"), "未进行持久保存"),
-                 (estimate("memory_update", slots=[{"name": "operation", "value": "delete", "evidence": "忘掉"}]), "未执行持久记录的删除"),
-                 (estimate("memory_query"), "没有可供核实的历史记录"),
+                 (estimate("memory_update", slots=[{"name": "operation", "value": "delete", "evidence": "忘掉"}]), "未进行持久保存或删除"),
+                 (estimate("memory_query"), "没有找到可供核实的相关记忆记录"),
                  (IntentEstimate.uncertain(), "请换个说法")]
         for intent, expected in cases:
             with self.subTest(intent=intent):
@@ -261,9 +261,9 @@ class IntentGraphTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(provider.messages, [])
 
     async def test_memory_query_uses_only_user_history(self):
-        """有会话历史时采用用户证据约束，不能读取其他会话。"""
+        """有会话历史时采用用户证据约束，不将模型推测视为长期事实。"""
         _, provider = await self.run_graph(estimate("memory_query"), history=[{"role": "user", "content": "我的方向是 NLP"}])
-        self.assertIn("只依据近期历史中的用户消息", provider.messages[0][0]["content"])
+        self.assertIn("只依据长期记录和近期用户原文", provider.messages[0][0]["content"])
         self.assertEqual(provider.messages[0][1]["content"], "我的方向是 NLP")
 
     async def test_clarification_missing_fields_and_contextual_other(self):

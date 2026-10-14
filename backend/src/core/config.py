@@ -8,6 +8,7 @@
 - 读取意图识别的独立总超时，分类复用现有 LLM 配置。
 - 读取默认时间时区、工具总超时及固定天气来源的启用开关。
 - 读取规划步骤上限与规划/综合回复的独立模型预算。
+- 读取长期记忆 SQLite 路径、启用开关及短期检查点保留时间。
 """
 
 from dataclasses import dataclass
@@ -30,6 +31,10 @@ class Settings:
     tool_timeout_ms: int = max(100, int(getenv("MIRA_TOOL_TIMEOUT_MS", "5000")))
     plan_max_steps: int = max(2, min(12, int(getenv("MIRA_PLAN_MAX_STEPS", "6"))))
     plan_timeout_ms: int = max(100, int(getenv("MIRA_PLAN_TIMEOUT_MS", "15000")))
+    memory_enabled: bool = getenv("MIRA_MEMORY_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    memory_db_path: str = getenv("MIRA_MEMORY_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "memory.sqlite3"))
+    memory_timeout_ms: int = max(100, int(getenv("MIRA_MEMORY_TIMEOUT_MS", "10000")))
+    working_memory_ttl_seconds: int = max(60, int(getenv("MIRA_WORKING_MEMORY_TTL_SECONDS", "3600")))
     default_timezone: str = getenv("MIRA_DEFAULT_TIMEZONE", "Asia/Shanghai").strip()
     weather_enabled: bool = getenv("MIRA_WEATHER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     asr_url: str = getenv("MIRA_ASR_URL", "").strip()

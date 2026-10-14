@@ -9,6 +9,7 @@
 - 在可取消的生成任务中识别最终意图，冻结结果后交给现有 Agent 路由。
 - 提供真实工具目录、保存会话参数澄清及结果，过滤取消后的旧工具事件。
 - 原子保存计划与跨轮澄清，管理多步结果和任务恢复，沿用整轮截止时间。
+- 通过浏览器凭据验证会话归属，分类前同步 Checkpointer，并处理记忆删除通知。
 """
 
 import asyncio
@@ -29,6 +30,7 @@ from src.contracts.tools import PendingClarification, ToolResult
 from src.contracts.agent import TaskPlan
 from src.evaluation.trace import now_ms
 from src.gateway.sender import EventSender
+from src.gateway.identity import owns_session
 from src.intent.service import build_context_summary
 from src.output.coordinator import OutputCoordinator
 from src.providers.llm import LLMError
@@ -73,7 +75,7 @@ def decode_message(message: dict) -> tuple[dict, bytes | None]:
 async def realtime(websocket: WebSocket, session_id: str):
     """建立单播放端连接，实时控制不依赖模型及转写任务。"""
     session = websocket.app.state.sessions.get(session_id)
-    if session is None:
+    if session is None or not owns_session(websocket, session):
         await websocket.close(code=1008, reason="未知会话")
         return
     await websocket.accept()
@@ -120,6 +122,9 @@ async def realtime(websocket: WebSocket, session_id: str):
         """仅在全部音频终态后报告真实交付或降级结果。"""
         record = session.finish_if_delivered()
         if record:
+            agent = websocket.app.state.agent
+            if hasattr(agent, "refresh_delivery"):
+                await agent.refresh_delivery(session, record.generation_id)
             # 新回复已交付后，下一次重述应指向最新输出，不沿用更早的中断。
             if session.interruption and session.interruption.generation_id != record.generation_id:
                 session.interruption = None
@@ -140,7 +145,9 @@ async def realtime(websocket: WebSocket, session_id: str):
                         await asyncio.sleep(.02)
             if session.generation_id != generation_id:
                 return
-            history = session.context_history(generation_id)
+            agent = websocket.app.state.agent
+            history = (await agent.prepare_turn(session, generation_id) if hasattr(agent, "prepare_turn")
+                       else session.context_history(generation_id))
             summary = build_context_summary(history, session.interruption.model_dump() if session.interruption else None)
             started_ms = now_ms()
             registry = getattr(websocket.app.state, "tool_registry", None)
@@ -173,6 +180,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                     if previous:
                         session.interruption = session.snapshot_interruption(previous[-1])
             runtime_context = {"social_state": session.social_snapshot(text, intent).model_dump(),
+                               "turn_id": turn_id,
                                "interruption_state": session.interruption.model_dump() if session.interruption else None,
                                "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None,
                                "active_plan": session.active_plan.model_dump(mode="json") if session.active_plan and intent.continues_pending else None,
@@ -203,6 +211,14 @@ async def realtime(websocket: WebSocket, session_id: str):
                 if session.generation_id != generation_id or session.connection_epoch != epoch:
                     return
                 kind, payload = item["type"], item["payload"]
+                if kind == "memory.result":
+                    if payload.get("cleared"):
+                        # 删除通知先于确认回复发送，避免清空刚生成的确认消息。
+                        while session.memory_notifications:
+                            notification = session.memory_notifications.pop(0)
+                            await send(notification["type"], notification["payload"], generation_id=notification["generation_id"])
+                    session.trace.record("memory.result", record.trace_id, {"status": payload["status"]})
+                    continue
                 if kind == "plan.updated":
                     plan = TaskPlan.model_validate(payload["plan"])
                     record.task_plan = plan.model_copy(deep=True)
@@ -386,6 +402,9 @@ async def realtime(websocket: WebSocket, session_id: str):
                     or sender.task.done()):
                 await websocket.close(code=1008, reason="会话已关闭或被接管")
                 return
+            while session.memory_notifications:
+                notification = session.memory_notifications.pop(0)
+                await send(notification["type"], notification["payload"], generation_id=notification["generation_id"])
             for old in list(session.outputs.values()):
                 if (old.status == "cancelled" and not old.stop_confirmed and not old.stop_timed_out
                         and now_ms() - old.cancelled_at_ms > session.stop_ack_timeout_ms):

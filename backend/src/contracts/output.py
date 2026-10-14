@@ -5,9 +5,11 @@
 - 保存带来源和精确度标志的中断快照。
 - 在输出账本保存单次工具结果，恢复时复述原事实而不重复执行。
 - 保存有界的多步结果和任务快照，取消后恢复只复述原事实。
+- 记录轮次创建时间，为短期记忆过期过滤提供依据。
 """
 
 from typing import Literal
+from time import time
 from pydantic import BaseModel, Field
 from src.contracts.tools import ToolResult
 from src.contracts.agent import TaskPlan
@@ -45,6 +47,7 @@ class InterruptionState(BaseModel):
 class OutputRecord(BaseModel):
     """保存一个 generation 的生成计划和客户端交付事实。"""
     generation_id: str
+    created_at: float = Field(default_factory=time)
     turn_id: str
     user_text: str
     trace_id: str
