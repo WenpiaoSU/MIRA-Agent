@@ -265,8 +265,9 @@ class ToolGatewayTests(unittest.IsolatedAsyncioTestCase):
         await self.ws.close()
         await asyncio.wait_for(self.task, 3)
 
-    async def submit(self, text, intent, turn_id="turn-test"):
-        """提供本轮分类 JSON 并等待真实回复交付完成。"""
+    async def submit(self, text, intent, turn_id=None):
+        """为每轮分配独立标识，提供分类 JSON 并等待真实回复交付完成。"""
+        turn_id = turn_id or f"turn-test-{self.ws.seq}"
         self.provider.raw = intent.model_dump_json()
         await self.ws.send("input.text", {"text": text}, turn_id)
         response = await self.ws.until("response.completed")

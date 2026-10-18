@@ -4,10 +4,12 @@
 - 顺序执行一个工具步骤，依赖值仅来自已验证成功结果。
 - 保存参数缺项与领域消歧状态，补充后跳过已成功步骤。
 - 在失败时停止剩余步骤，以固定模板展示已完成事实。
+- 为提醒步骤保留跨轮幂等键并显式传递已验证的绑定参数来源。
 """
 
 from datetime import datetime, timedelta, timezone
 from copy import deepcopy
+from dataclasses import replace
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
@@ -17,7 +19,7 @@ from src.agent.planner import pointer_parts
 from src.agent.tool_response import render_tool_result
 from src.contracts.agent import PlanStep, TaskPlan
 from src.contracts.perception import IntentEstimate
-from src.contracts.tools import PendingClarification, ToolCallRequest
+from src.contracts.tools import PendingClarification, ToolCallRequest, ToolContext
 from src.tools.executor import ToolExecutor
 
 
@@ -98,7 +100,8 @@ class PlanExecution:
             supplied = set(step.arguments).union(step.bindings)
             missing = [name for name in registered.spec.input_schema.get("required", []) if name not in supplied]
             if missing:
-                labels = {"location": "城市及省份或国家", "timezone": "IANA 时区", "iso_time": "带时区的 ISO 时间"}
+                labels = {"location": "城市及省份或国家", "timezone": "IANA 时区", "iso_time": "带时区的 ISO 时间",
+                          "title": "提醒事项", "due_at": "具体提醒时间", "target": "提醒编号或唯一标题"}
                 question = f"任务步骤需要补充：{'、'.join(labels.get(name, name) for name in missing)}。"
                 self.wait(writer, plan, step, missing, question)
                 return question
@@ -114,7 +117,8 @@ class PlanExecution:
         plan.status = "waiting_input"
         pending = PendingClarification(original_text=plan.original_text, tool_name=step.tool_name,
                                        arguments=step.arguments, missing_slots=missing, question=question,
-                                       plan_id=plan.plan_id, step_id=step.step_id)
+                                       plan_id=plan.plan_id, step_id=step.step_id,
+                                       execution_id=plan.execution_id, reference_at=plan.reference_at)
         self.publish(writer, plan, pending)
 
     def fail(self, writer, plan: TaskPlan, step: PlanStep, message: str) -> str:
@@ -129,7 +133,7 @@ class PlanExecution:
         self.publish(writer, plan)
         return plan.response_text
 
-    async def execute(self, writer, plan: TaskPlan, deadline_at: datetime) -> str | None:
+    async def execute(self, writer, plan: TaskPlan, deadline_at: datetime, context: ToolContext | None = None) -> str | None:
         """执行当前一个工具步骤；缺参或失败返回收尾文本，成功推进下一节点。"""
         step = current_step(plan)
         binding = self.executor.registry.get(step.tool_name)
@@ -144,7 +148,8 @@ class PlanExecution:
             return self.fail(writer, plan, step, "参数或依赖字段不符合工具规范。")
         missing = [name for name in binding.spec.input_schema.get("required", []) if name not in arguments]
         if missing:
-            labels = {"location": "城市及省份或国家", "timezone": "IANA 时区", "iso_time": "带时区的 ISO 时间", "date": "日期"}
+            labels = {"location": "城市及省份或国家", "timezone": "IANA 时区", "iso_time": "带时区的 ISO 时间", "date": "日期",
+                      "title": "提醒事项", "due_at": "具体提醒时间", "target": "提醒编号或唯一标题"}
             question = f"任务步骤需要补充：{'、'.join(labels.get(name, name) for name in missing)}。"
             self.wait(writer, plan, step, missing, question)
             return question
@@ -156,7 +161,9 @@ class PlanExecution:
                                                timedelta(milliseconds=self.executor.timeout_ms)))
         metadata = {"task_plan_id": plan.plan_id, "step_id": step.step_id, "call_id": call.call_id, "tool_name": call.tool_name}
         writer({"type": "tool.started", "payload": metadata})
-        result = await self.executor.execute(call)
+        step_context = (replace(context, operation_id=f"{context.operation_id}:{step.step_id}",
+                                bound_arguments=frozenset(step.bindings)) if context else None)
+        result = await self.executor.execute(call, step_context)
         step.result = result
         writer({"type": "tool.result", "payload": {"result": result.model_dump(mode="json"), **metadata}})
         if result.error and result.error.missing_slots:

@@ -6,6 +6,7 @@
 - 校验浏览器实际播放的语段位置反馈。
 - 定义单个完整 WAV 语段的 TTS 输出负载。
 - 生成带时间戳、序号和追踪标识的服务端事件。
+- 校验提醒展示回执，区分通知展示与语音播报。
 """
 
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
+from src.contracts.reminders import ReminderAckPayload
 
 
 class TimeRef(BaseModel):
@@ -46,6 +48,12 @@ class ClientEnvelope(BaseModel):
 class TextPayload(BaseModel):
     """限制用户输入文本的长度。"""
     text: str = Field(min_length=1, max_length=4000)
+
+
+class ReminderAckInput(ClientEnvelope):
+    """确认本连接已展示一条提醒，不把 WebSocket 发送当成交付。"""
+    type: Literal["reminder.displayed"]
+    payload: ReminderAckPayload
 
 
 class TextInput(ClientEnvelope):

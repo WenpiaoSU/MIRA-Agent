@@ -4,6 +4,7 @@
 - 在真正发送时分配序号并重新校验连接及输出代次。
 - 使用有界优先级队列，取消不等待未发送的媒体队列。
 - 对网络发送设置截止时间，关闭时回收等待者。
+- 提醒播报起点与普通输出采用相同代次过滤，不能在取消后接管播放器。
 """
 
 import asyncio
@@ -45,7 +46,7 @@ class EventSender:
         try:
             while True:
                 _, _, kind, payload, turn_id, generation_id, source, trace_id, causation_id, future = await self.queue.get()
-                output_kind = kind in {"behavior.plan", "response.segment", "response.completed", "tts.chunk", "tts.error"}
+                output_kind = kind in {"behavior.plan", "response.segment", "response.completed", "tts.chunk", "tts.error", "reminder.speech"}
                 stale = self.session.connection_epoch != self.epoch or (
                     output_kind and generation_id != self.session.generation_id)
                 if stale or future.cancelled():

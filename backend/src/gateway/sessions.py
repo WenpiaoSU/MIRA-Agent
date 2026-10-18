@@ -4,7 +4,7 @@
 - 校验连接事件顺序并保存有界轮次历史。
 - 分离生成计划、字幕展示、音频播放和输出失败。
 - 取消任务时保存中断快照，迟到回执只更新所属旧输出。
-- 提供冻结社会状态及脱敏轨迹，不让存储阻塞停止链路。
+- 将最终输入、轮次和执行事实送入 M08，提供隔离快照及脱敏轨迹。
 - 将当前轮次的意图显式加入快照，不保存跨轮次的隐式意图。
 - 保存一个待澄清工具请求和有界结果账本，控制请求不重新执行查询。
 - 保存一个活跃任务计划，并在取消或连接接管时终止剩余步骤。
@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from src.contracts.output import InterruptionState, OutputRecord, SegmentDelivery
-from src.contracts.state import SocialState
+from src.contracts.state import ActionState, CommittedUtterance, SocialState
+from src.social_state import SocialStateService
 from src.contracts.perception import IntentEstimate
 from src.contracts.tools import PendingClarification
 from src.contracts.agent import TaskPlan
@@ -49,6 +50,8 @@ class Session:
     trace: TraceRecorder = field(default_factory=TraceRecorder)
     last_playback_at_ms: int = 0
     stop_ack_timeout_ms: int = 2000
+    social_state: SocialStateService = field(default_factory=SocialStateService)
+    closed: bool = False
 
     def accept_event(self, event_id: str, seq: int) -> bool:
         """拒绝重复事件和倒退序号，保持单连接的顺序边界。"""
@@ -61,8 +64,10 @@ class Session:
         return True
 
     def begin_generation(self, generation_id: str, turn_id: str = "", user_text: str = "",
-                         trace_id: str = "", speech_enabled: bool = False) -> OutputRecord:
+                         trace_id: str = "", speech_enabled: bool = False, source: str = "text") -> OutputRecord:
         """立即保存用户最终输入，新代次不会清除旧输出的停止记录。"""
+        if self.closed:
+            raise ValueError("会话已关闭")
         self.generation_id = generation_id
         record = OutputRecord(generation_id=generation_id, turn_id=turn_id,
                               user_text=user_text, trace_id=trace_id or generation_id,
@@ -73,6 +78,11 @@ class Session:
         self.turn.begin(generation_id)
         self.last_playback_at_ms = now_ms()
         self.trace.record("generation.started", record.trace_id, {"generation_id": generation_id})
+        self.sync_social_state()
+        if user_text and turn_id:
+            self.social_state.emit(self.session_id, "utterance.committed",
+                                   CommittedUtterance(text=user_text, source=source), source="turn",
+                                   turn_id=turn_id, generation_id=generation_id)
         return record
 
     def cancel_generation(self, reason: str = "user_stop") -> str | None:
@@ -101,6 +111,7 @@ class Session:
         self.generation_task = None
         if task and not task.done() and task is not current_task:
             task.cancel()
+        self.sync_social_state()
         return old
 
     def cancel_plan(self) -> None:
@@ -143,6 +154,9 @@ class Session:
         record = self.outputs[generation_id or self.generation_id]
         record.segments[segment_id].duration_ms = duration_ms
         self.last_playback_at_ms = now_ms()
+        if record.generation_id == self.generation_id and record.turn_id:
+            self.social_action(ActionState(action_id=segment_id, kind="playback", status="pending",
+                                          generation_id=record.generation_id, turn_id=record.turn_id))
 
     def displayed(self, generation_id: str, segment_id: str) -> bool:
         """确认已显示的字幕，旧取消输出不能新增展示事实。"""
@@ -185,6 +199,13 @@ class Session:
         self.last_playback_at_ms = now_ms()
         if self.interruption and self.interruption.generation_id == target:
             self.interruption = self.snapshot_interruption(record)
+        self.sync_social_state()
+        if target == self.turn.generation_id and record.status != "cancelled" and record.turn_id:
+            self.social_action(ActionState(action_id=segment_id, kind="playback", generation_id=target,
+                                          turn_id=record.turn_id, status=("running" if phase in {"started", "progress"}
+                                              else "error" if phase == "failed" else "cancelled" if phase == "stopped"
+                                              else "pending" if phase == "paused" else "ok"),
+                                          verified=phase == "ended"))
         return True
 
     def confirm_stop(self, generation_id: str, command_id: str) -> bool:
@@ -201,6 +222,7 @@ class Session:
             self.interruption = self.snapshot_interruption(record)
         self.trace.record("output.stop_confirmed", record.trace_id,
                           {"generation_id": generation_id, "elapsed_ms": now_ms() - record.cancelled_at_ms})
+        self.sync_social_state()
         return True
 
     @staticmethod
@@ -246,6 +268,7 @@ class Session:
         self.generation_id = None
         self.turn.generating = False
         self.turn.stopped(record.generation_id)
+        self.sync_social_state()
         return record
 
     def context_history(self, exclude_generation: str | None = None) -> list[dict[str, str]]:
@@ -280,27 +303,65 @@ class Session:
         """提供由输出账本推导的兼容历史读取接口。"""
         return self.context_history()
 
+    def sync_social_state(self) -> None:
+        """将现有轮次和澄清账本投影到 M08，未变化的投影不制造新版本。"""
+        if self.closed:
+            return
+        service = self.social_state
+        service.bind(self.session_id, self.user_id, self.connection_epoch)
+        record = self.outputs.get(self.turn.generation_id)
+        interaction = self.turn.snapshot().model_copy(update={"turn_id": record.turn_id if record else None})
+        state = service.snapshot(self.session_id)
+        if interaction != state.interaction:
+            service.emit(self.session_id, "turn.updated", interaction, source="turn")
+        dialogue = state.dialogue.model_copy(update={
+            "pending_question": self.pending_clarification.question[:1000] if self.pending_clarification else None,
+            "recent_turn_ids": tuple(item.turn_id for item in list(self.outputs.values())[-12:])})
+        if dialogue != state.dialogue:
+            service.emit(self.session_id, "dialogue.updated", dialogue, source="dialogue")
+
+    def social_action(self, action: ActionState) -> None:
+        """聚合已由网关校验的当前执行摘要，不复制工具正文。"""
+        if self.closed:
+            return
+        self.sync_social_state()
+        self.social_state.emit(self.session_id, "action.updated", action, source="execution",
+                               turn_id=action.turn_id, generation_id=action.generation_id)
+
     def social_snapshot(self, text: str | None = None, intent: IntentEstimate | None = None) -> SocialState:
-        """冻结本轮文本与意图；没有新识别结果时意图为空。"""
-        return SocialState(session_id=self.session_id, user_id=self.user_id, version=self.turn.version,
-                           as_of_ms=now_ms(), interaction=self.turn.snapshot(), committed_text=text,
-                           intent=intent.model_copy(deep=True) if intent else None)
+        """冻结当前 M08 状态；兼容无输出账本时的独立上下文预览。"""
+        if self.closed:
+            raise ValueError("会话已关闭")
+        self.sync_social_state()
+        state = self.social_state.snapshot(self.session_id)
+        record = self.outputs.get(self.generation_id)
+        if record and record.turn_id and intent is not None:
+            self.social_state.emit(self.session_id, "intent.updated", intent, source="intent",
+                                   turn_id=record.turn_id, generation_id=record.generation_id)
+            state = self.social_state.snapshot(self.session_id)
+        elif text is not None and record is None:
+            # 独立预览不提交轮次，不产生可被后续推理沿用的意图。
+            state = state.model_copy(update={"committed_text": text,
+                                             "intent": intent.model_copy(deep=True) if intent else None}, deep=True)
+        return state
 
 
 class SessionRegistry:
     """管理服务进程内会话并在删除时停止生成。"""
 
-    def __init__(self):
+    def __init__(self, social_state: SocialStateService | None = None):
         """初始化按会话标识索引的内存表。"""
         self.sessions: dict[str, Session] = {}
         self.forget_checkpoint = None
         self.invalidate_checkpoint = None
+        self.social_state = social_state or SocialStateService()
 
     def create(self, user_id: str | None = None, owner_token_hash: str | None = None) -> Session:
         """创建会话；用户归属由服务端验证后的浏览器凭据提供。"""
         session = Session(user_id=user_id, owner_token_hash=owner_token_hash,
-                          invalidate_checkpoint=self.invalidate_checkpoint)
+                          invalidate_checkpoint=self.invalidate_checkpoint, social_state=self.social_state)
         self.sessions[session.session_id] = session
+        session.sync_social_state()
         return session
 
     def get(self, session_id: str) -> Session | None:
@@ -312,6 +373,8 @@ class SessionRegistry:
         session = self.sessions.pop(session_id, None)
         if session:
             session.cancel_generation("disconnect")
+            session.closed = True
+            self.social_state.close(session_id)
             if self.forget_checkpoint:
                 self.forget_checkpoint(session_id)
 
@@ -339,5 +402,6 @@ class SessionRegistry:
                 session.outputs[current_generation] = record
             if self.forget_checkpoint:
                 self.forget_checkpoint(session.session_id)
+            session.social_state.emit(session.session_id, "memory.cleared", source="memory")
             session.memory_notifications.append({"type": "memory.cleared", "payload": {}, "generation_id": None})
 

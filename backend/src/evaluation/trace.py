@@ -7,6 +7,7 @@
 - 记录意图枚举、分类耗时与澄清状态，不保留槽位和用户正文。
 - 记录工具名称、调用标识、验证状态与安全错误码，不保留参数或结果正文。
 - 记录任务计划标识、步骤归属和步数，保持任务计划与行为计划分离。
+- 记录 Agent 冻结的社会状态版本，不保存感知正文或情绪推断。
 """
 
 from collections import deque
@@ -33,7 +34,7 @@ class TraceRecorder:
                    "reason", "played_ms", "clock_ms", "command_id", "status", "elapsed_ms",
                    "stop_elapsed_ms", "speech_to_stop_ms", "intent", "confidence", "needs_clarification",
                    "tool_name", "call_id", "verified", "error_code", "needs_planning",
-                   "task_plan_id", "step_id", "step_count"}
+                   "task_plan_id", "step_id", "step_count", "state_version"}
         self.events.append({"type": event_type, "trace_id": trace_id,
                             "causation_id": causation_id, "server_ms": now_ms(),
                             "payload": {key: value for key, value in payload.items() if key in allowed}})

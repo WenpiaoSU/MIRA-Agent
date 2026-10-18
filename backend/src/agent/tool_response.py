@@ -4,14 +4,24 @@
 - 格式化时间、当前天气和逐日预报，保留时区、时间与来源。
 - 失败仅展示安全错误；重复或继续只复述原结果，不重新查询。
 - 格式化本地时间转换和日期偏移结果。
+- 以持久化回执展示提醒编号、时间、事项与取消状态。
 """
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from src.contracts.tools import ToolResult
 from src.tools.builtin.time import TimeData
 from src.tools.builtin.weather import WeatherData
 from src.tools.builtin.datetime import ConvertedTime
+from src.contracts.reminders import ReminderRecord
+
+
+def reminder_description(raw: dict) -> str:
+    """统一显示用户选择的时区和提醒标识，便于后续准确取消。"""
+    data = ReminderRecord.model_validate(raw)
+    due = datetime.fromisoformat(data.due_at).astimezone(ZoneInfo(data.timezone))
+    return f"{data.title}；{due:%Y-%m-%d %H:%M:%S}（{data.timezone}）；编号 {data.reminder_id}"
 
 
 def render_tool_result(result: ToolResult) -> str:
@@ -35,4 +45,11 @@ def render_tool_result(result: ToolResult) -> str:
     if result.tool_name == "convert_datetime":
         data = ConvertedTime.model_validate(result.data)
         return f"转换后的时间为 {data.iso_time}（{data.timezone}），当地日期为 {data.date}。"
+    if result.tool_name == "create_reminder":
+        return "已创建一次性提醒：" + reminder_description(result.data) + "。"
+    if result.tool_name == "cancel_reminder":
+        return "已取消提醒：" + reminder_description(result.data) + "。"
+    if result.tool_name == "list_reminders":
+        records = result.data["reminders"]
+        return ("待提醒事项：\n" + "\n".join(reminder_description(row) for row in records)) if records else "目前没有待提醒事项。"
     return "查询已完成，但当前没有这项工具的结果展示模板。"

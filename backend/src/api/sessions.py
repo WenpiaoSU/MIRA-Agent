@@ -4,6 +4,7 @@
 - 创建进程内会话并返回连接所需标识与语音能力。
 - 关闭指定会话，并提供仅含控制元数据的轨迹查看接口。
 - 创建或恢复浏览器身份，并验证关闭和轨迹查询的会话归属。
+- 提醒与记忆共享浏览器身份，各自报告实际可用能力。
 """
 
 import sqlite3
@@ -22,10 +23,11 @@ async def open_session(request: Request, response: Response):
     """创建会话并告知前端当前支持的输入与角色能力。"""
     registry: SessionRegistry = request.app.state.sessions
     memory = getattr(request.app.state, "memory", None)
+    database = getattr(request.app.state, "database", None) or (memory.repository if memory else None)
     identity = None
-    if memory:
+    if database:
         try:
-            identity = await memory.repository.identity(request.cookies.get(COOKIE_NAME), create=True)
+            identity = await database.identity(request.cookies.get(COOKIE_NAME), create=True)
         except (sqlite3.Error, OSError):
             pass
     if identity:
@@ -35,7 +37,7 @@ async def open_session(request: Request, response: Response):
         session = registry.create(user_id, token_digest(token))
     else:
         session = registry.create()
-    return {"session_id": session.session_id, "user_id": session.user_id, "connection_epoch": session.connection_epoch, "feature_flags": {"text": True, "avatar": True, "audio": request.app.state.speech_service.ready, "vision": False, "long_term_memory": bool(identity)}, "negotiated_formats": {"audio": {"encoding": "pcm_s16le", "sample_rate": 16000, "channels": 1, "frame_ms": 20}}}
+    return {"session_id": session.session_id, "user_id": session.user_id, "connection_epoch": session.connection_epoch, "feature_flags": {"text": True, "avatar": True, "audio": request.app.state.speech_service.ready, "vision": False, "long_term_memory": bool(identity and memory), "reminders": bool(identity and getattr(request.app.state, "reminders", None))}, "negotiated_formats": {"audio": {"encoding": "pcm_s16le", "sample_rate": 16000, "channels": 1, "frame_ms": 20}}}
 
 
 @router.delete("/{session_id}")

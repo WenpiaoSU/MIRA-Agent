@@ -1,9 +1,10 @@
-"""作用：执行一次有界只读工具调用并验证返回值。
+"""作用：执行一次有界工具调用并验证返回值。
 
 当前功能：
 - 按真实白名单检查工具及输入输出 JSON Schema。
 - 统一处理截止时间、服务异常和安全参数澄清，不自动重试。
 - 将任务取消向上传递，不把取消或非法结果当作查询成功。
+- 为用户隔离的业务工具注入可信上下文，写入未确认时提示核查。
 """
 
 import asyncio
@@ -17,7 +18,7 @@ from jsonschema import Draft202012Validator, ValidationError as SchemaValidation
 from pydantic import ValidationError
 from referencing.exceptions import Unresolvable
 
-from src.contracts.tools import ToolCallRequest, ToolError, ToolResult
+from src.contracts.tools import ToolCallRequest, ToolContext, ToolError, ToolResult
 from src.tools.registry import ToolRegistry
 
 
@@ -34,7 +35,7 @@ class ToolFailure(Exception):
 
 
 class ToolExecutor:
-    """一次请求最多调用一个已注册处理函数，没有重试和写入副作用。"""
+    """一次请求最多调用一个已注册处理函数，写工具自行负责事务和幂等。"""
 
     def __init__(self, registry: ToolRegistry, timeout_ms: int = 5000):
         """注入真实目录与执行总预算，网络步骤共用同一次截止时间。"""
@@ -43,7 +44,7 @@ class ToolExecutor:
         self.registry = registry
         self.timeout_ms = timeout_ms
 
-    async def execute(self, request: ToolCallRequest) -> ToolResult:
+    async def execute(self, request: ToolCallRequest, context: ToolContext | None = None) -> ToolResult:
         """验证后执行，并只为完整、有限、符合输出 Schema 的数据标记成功。"""
         started = monotonic()
         task = asyncio.current_task()
@@ -60,7 +61,12 @@ class ToolExecutor:
             if not Draft202012Validator(tool.spec.input_schema).is_valid(request.arguments):
                 raise ToolFailure("invalid_arguments", "工具参数无效，请重新说明查询条件。")
             async with asyncio.timeout(budget):
-                data = await tool.handler(dict(request.arguments))
+                if tool.needs_context:
+                    if context is None or not context.user_id:
+                        raise ToolFailure("identity_required", "持久化用户身份暂时不可用，请重新连接后再试。")
+                    data = await tool.handler(dict(request.arguments), context)
+                else:
+                    data = await tool.handler(dict(request.arguments))
                 if task and task.cancelling() > cancellations:
                     raise asyncio.CancelledError
                 if monotonic() - started >= budget:
@@ -86,5 +92,9 @@ class ToolExecutor:
             # 不输出异常正文，避免供应商响应或参数进入轨迹日志。
             logger.error("工具执行失败：%s", request.tool_name)
             error = ToolError(code="execution_error", message="查询未完成，请稍后重试。")
+        if tool and tool.spec.side_effect == "write" and error.code in {
+            "timeout", "service_unavailable", "invalid_result", "execution_error"
+        }:
+            error = ToolError(code="write_unconfirmed", message="提醒操作的结果尚未确认，请先查看提醒列表核实，避免重复创建。")
         return ToolResult(call_id=request.call_id, tool_name=request.tool_name, status="error", error=error,
                           elapsed_ms=round((monotonic() - started) * 1000))

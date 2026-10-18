@@ -8,6 +8,8 @@
 - 装配有界意图识别、时间工具及可关闭的单一来源天气工具。
 - 注入有界任务规划与时间转换工具，支持不同工具之间的字段依赖。
 - 装配 Checkpointer 短期记忆与 SQLite 长期记忆，启动故障保留普通对话能力。
+- 在同一 SQLite 装配一次性提醒工具和浏览器投递所需存储。
+- 将配置化的 M08 状态服务注入现有会话注册表。
 """
 
 from fastapi import FastAPI
@@ -31,7 +33,10 @@ from src.tools.builtin.datetime import convert_datetime, DATETIME_SPEC
 from src.memory.working import WorkingMemory
 from src.memory.service import MemoryService
 from src.repositories.memory import MemoryRepository
+from src.repositories.reminders import ReminderRepository
+from src.tools.builtin.reminders import register_reminder_tools
 from src.api import memories
+from src.social_state import SocialStateConfig, SocialStateService
 
 
 def create_app() -> FastAPI:
@@ -39,7 +44,10 @@ def create_app() -> FastAPI:
     app = FastAPI(title="MIRA Agent", version="0.1.0")
     settings = Settings()
     app.state.settings = settings
-    app.state.sessions = SessionRegistry()
+    app.state.social_state = SocialStateService(SocialStateConfig(
+        visual_ttl_ms=settings.state_visual_ttl_ms, affect_ttl_ms=settings.state_affect_ttl_ms,
+        max_lateness_ms=settings.state_max_lateness_ms, context_max_chars=settings.state_context_max_chars))
+    app.state.sessions = SessionRegistry(app.state.social_state)
     provider = ChatCompletionsProvider(settings)
     registry = ToolRegistry()
     registry.register(TIME_SPEC, CurrentTimeTool(settings.default_timezone))
@@ -51,13 +59,20 @@ def create_app() -> FastAPI:
     app.state.task_planner = TaskPlanner(provider, settings.plan_max_steps, settings.plan_timeout_ms)
     working = WorkingMemory(settings.working_memory_ttl_seconds)
     app.state.memory = None
-    if settings.memory_enabled:
+    app.state.database = None
+    app.state.reminders = None
+    if settings.memory_enabled or settings.reminders_enabled:
         try:
             repository = MemoryRepository(settings.memory_db_path)
-            app.state.memory = MemoryService(repository, provider, settings.memory_timeout_ms)
-            app.state.memory.on_delete = app.state.sessions.forget_memories
+            app.state.database = repository
+            if settings.memory_enabled:
+                app.state.memory = MemoryService(repository, provider, settings.memory_timeout_ms)
+                app.state.memory.on_delete = app.state.sessions.forget_memories
+            if settings.reminders_enabled:
+                app.state.reminders = ReminderRepository(repository)
+                register_reminder_tools(registry, app.state.reminders, settings.default_timezone)
         except (sqlite3.Error, OSError):
-            logging.getLogger(__name__).warning("长期记忆初始化失败，普通对话仍可使用")
+            logging.getLogger(__name__).warning("持久化存储初始化失败，受影响的存储能力不可用，普通对话仍可使用")
     app.state.sessions.forget_checkpoint = working.forget
     app.state.sessions.invalidate_checkpoint = working.invalidate
     app.state.agent = AgentGraph(provider, app.state.tool_executor, app.state.task_planner, app.state.memory, working)

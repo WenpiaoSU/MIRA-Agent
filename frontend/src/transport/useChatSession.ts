@@ -6,6 +6,7 @@
  * - 同步停音、清动作并发送最终位置和取消执行回执。
  * - 以实际播放开始与媒体时钟驱动角色，断线后有界重连。
  * - 记忆删除后清空本地对话正文和待展示缓存，保留当前删除确认的输出位置。
+ * - 去重到期提醒并在 React 展示后确认，空闲提醒语音复用现有播放器和停止链路。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -50,6 +51,7 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
   const cancelled = useRef(new Set<string>());
   const displayed = useRef(new Set<string>());
   const pendingDisplay = useRef(new Map<string, { messageId: string; generationId: string; segmentId: string }>());
+  const pendingReminders = useRef(new Map<string, string>());
   const traceId = useRef<string>(crypto.randomUUID());
   const behaviorCallback = useRef(onBehavior);
   behaviorCallback.current = onBehavior;
@@ -70,6 +72,12 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
 
   /** React 提交字幕后再确认展示，避免把仅入队的更新记成已显示。 */
   useEffect(() => {
+    for (const [reminderId, token] of pendingReminders.current) {
+      if (messages.some(item => item.id === 'assistant:reminder:' + reminderId && item.text)) {
+        sendEvent('reminder.displayed', { reminder_id: reminderId, delivery_token: token });
+        pendingReminders.current.delete(reminderId);
+      }
+    }
     for (const [key, receipt] of pendingDisplay.current) {
       if (cancelled.current.has(receipt.generationId)) {
         pendingDisplay.current.delete(key);
@@ -157,6 +165,7 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
       behaviorCallback.current(null);
       setSpeechBusy(false);
       pendingDisplay.current.clear();
+      pendingReminders.current.clear();
       setInteractionState('disconnected');
       setTranscript('');
       setMessages(previous => previous.map(item => ({ ...item, pending: false })));
@@ -207,6 +216,28 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
           if (event.connection_epoch !== connectionEpoch.current) return;
           serverSeq.current = event.seq;
           const generationId = event.generation_id;
+          if (event.type === 'reminder.due') {
+            const { reminder_id: id, delivery_token: token, text } = event.payload;
+            if (typeof id !== 'string' || typeof token !== 'string' || typeof text !== 'string' || !text) return;
+            pendingReminders.current.set(id, token);
+            const messageId = 'assistant:reminder:' + id;
+            // 稳定提醒编号在重发时替换同一行，不重复插入；新租约仍需回执。
+            setMessages(previous => previous.some(item => item.id === messageId)
+              ? previous.map(item => item.id === messageId ? { ...item, text } : item)
+              : [...previous, { id: messageId, role: 'assistant', text }]);
+            return;
+          }
+          if (event.type === 'reminder.speech' && generationId) {
+            // 用户已在本地提交新输入时，拒绝接管其输出位置，服务端随后会取消旧提醒语音。
+            if (activeTurnId.current || cancelled.current.has(generationId)) return;
+            activeTurnId.current = event.turn_id ?? null;
+            activeGenerationId.current = generationId;
+            pendingBehavior.current = null;
+            currentBehavior.current = null;
+            behaviorCallback.current(null);
+            setSpeechBusy(true);
+            return;
+          }
           if (event.type === 'memory.cleared') {
             displayed.current.clear();
             pendingDisplay.current.clear();

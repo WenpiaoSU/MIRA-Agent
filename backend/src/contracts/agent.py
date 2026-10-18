@@ -88,6 +88,8 @@ class TaskPlan(BaseModel):
     steps: list[PlanStep] = Field(min_length=2, max_length=12)
     status: Literal["pending", "running", "waiting_input", "completed", "failed", "cancelled"] = "pending"
     response_text: str = ""
+    execution_id: str | None = None
+    reference_at: str | None = None
 
 
 class PlanAnswer(BaseModel):

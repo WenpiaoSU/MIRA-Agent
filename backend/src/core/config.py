@@ -9,6 +9,8 @@
 - 读取默认时间时区、工具总超时及固定天气来源的启用开关。
 - 读取规划步骤上限与规划/综合回复的独立模型预算。
 - 读取长期记忆 SQLite 路径、启用开关及短期检查点保留时间。
+- 读取一次性提醒开关，复用现有 SQLite 文件与默认时区。
+- 读取 M08 的视觉/情感 TTL、迟到窗口与摘要字符预算。
 """
 
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ class Settings:
     plan_max_steps: int = max(2, min(12, int(getenv("MIRA_PLAN_MAX_STEPS", "6"))))
     plan_timeout_ms: int = max(100, int(getenv("MIRA_PLAN_TIMEOUT_MS", "15000")))
     memory_enabled: bool = getenv("MIRA_MEMORY_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+    reminders_enabled: bool = getenv("MIRA_REMINDERS_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     memory_db_path: str = getenv("MIRA_MEMORY_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "memory.sqlite3"))
     memory_timeout_ms: int = max(100, int(getenv("MIRA_MEMORY_TIMEOUT_MS", "10000")))
     working_memory_ttl_seconds: int = max(60, int(getenv("MIRA_WORKING_MEMORY_TTL_SECONDS", "3600")))
@@ -56,6 +59,10 @@ class Settings:
     playback_timeout_ms: int = max(5000, int(getenv("MIRA_PLAYBACK_TIMEOUT_MS", "30000")))
     generation_timeout_ms: int = max(10000, int(getenv("MIRA_GENERATION_TIMEOUT_MS", "120000")))
     output_buffer_ms: int = max(1000, int(getenv("MIRA_OUTPUT_BUFFER_MS", "15000")))
+    state_visual_ttl_ms: int = max(0, int(getenv("MIRA_STATE_VISUAL_TTL_MS", "3000")))
+    state_affect_ttl_ms: int = max(0, int(getenv("MIRA_STATE_AFFECT_TTL_MS", "15000")))
+    state_max_lateness_ms: int = max(0, int(getenv("MIRA_STATE_MAX_LATENESS_MS", "5000")))
+    state_context_max_chars: int = max(1024, int(getenv("MIRA_STATE_CONTEXT_MAX_CHARS", "6000")))
 
     @property
     def llm_ready(self) -> bool:

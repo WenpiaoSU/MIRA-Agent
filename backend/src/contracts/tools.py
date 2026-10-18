@@ -2,12 +2,13 @@
 
 当前功能：
 - 保存双向 JSON Schema，并禁止校验时加载外部引用。
-- 约束一次只读调用的截止时间、验证结果和安全错误。
+- 约束工具调用的截止时间、服务端上下文、验证结果和安全错误。
 - 保存每个会话最多一个待补充的工具请求。
 - 为计划内的澄清请求保存任务与步骤归属。
 """
 
 from datetime import datetime
+from dataclasses import dataclass, field
 from typing import Literal, Self
 
 from jsonschema import Draft202012Validator, SchemaError
@@ -21,6 +22,7 @@ class ToolSpec(BaseModel):
     description: str = Field(min_length=1, max_length=1000)
     input_schema: dict[str, JsonValue]
     output_schema: dict[str, JsonValue] = Field(default_factory=lambda: {"type": "object"})
+    side_effect: Literal["read", "write"] = "read"
 
     @model_validator(mode="after")
     def validate_schema(self) -> Self:
@@ -106,6 +108,8 @@ class PendingClarification(BaseModel):
     question: str
     plan_id: str | None = None
     step_id: str | None = None
+    execution_id: str | None = None
+    reference_at: str | None = None
 
     @model_validator(mode="after")
     def validate_plan_binding(self) -> Self:
@@ -113,3 +117,14 @@ class PendingClarification(BaseModel):
         if (self.plan_id is None) != (self.step_id is None):
             raise ValueError("澄清任务和步骤标识必须同时提供")
         return self
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """由网关和 Agent 构造的可信上下文，不属于模型可填写的工具参数。"""
+    user_id: str | None
+    session_id: str
+    operation_id: str
+    request_text: str
+    reference_at: datetime
+    bound_arguments: frozenset[str] = field(default_factory=frozenset)

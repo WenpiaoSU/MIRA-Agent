@@ -10,6 +10,8 @@
 - 提供真实工具目录、保存会话参数澄清及结果，过滤取消后的旧工具事件。
 - 原子保存计划与跨轮澄清，管理多步结果和任务恢复，沿用整轮截止时间。
 - 通过浏览器凭据验证会话归属，分类前同步 Checkpointer，并处理记忆删除通知。
+- 后台轮询一次性提醒并接收展示回执，空闲后使用现有 TTS 输出账本播报。
+- 将最终输入、意图、健康与执行摘要聚合到 M08，冻结紧凑状态供 Agent 使用。
 """
 
 import asyncio
@@ -24,13 +26,15 @@ from pydantic import ValidationError
 from src.agent.recovery import control_action
 from src.contracts.realtime import (
     AudioEndInput, AudioFrameInput, AudioStartInput, CommandAckInput, DisplayedInput,
-    PlaybackInput, StopInput, TextInput,
+    PlaybackInput, StopInput, TextInput, ReminderAckInput,
 )
 from src.contracts.tools import PendingClarification, ToolResult
 from src.contracts.agent import TaskPlan
+from src.contracts.state import ActionState, HealthState
 from src.evaluation.trace import now_ms
 from src.gateway.sender import EventSender
 from src.gateway.identity import owns_session
+from src.gateway.reminders import ReminderDelivery, notification_text
 from src.intent.service import build_context_summary
 from src.output.coordinator import OutputCoordinator
 from src.providers.llm import LLMError
@@ -45,6 +49,7 @@ INPUT_MODELS = {
     "input.audio_frame": AudioFrameInput, "input.audio_end": AudioEndInput,
     "control.stop": StopInput, "response.displayed": DisplayedInput,
     "command.ack": CommandAckInput,
+    "reminder.displayed": ReminderAckInput,
     **{f"playback.{phase}": PlaybackInput for phase in ("started", "progress", "ended", "stopped", "failed", "paused")},
 }
 
@@ -90,6 +95,13 @@ async def realtime(websocket: WebSocket, session_id: str):
     session.turn.stopped(session.turn.generation_id)
     session.turn.generating = False
     session.turn.configure(False, "unavailable")
+    session.sync_social_state()
+    for component, ready in (("visual", False), ("user_affect", False),
+                             ("speech", websocket.app.state.speech_service.ready),
+                             ("tts", settings.tts_ready)):
+        session.social_state.emit(session_id, "health.updated", HealthState(
+            component=component, status="ok" if ready else "unavailable",
+            reason=None if ready else "not_configured"), source="health")
     sender = EventSender(websocket, session, epoch)
     generation_tasks: set[asyncio.Task] = set()
     audio_task = None
@@ -98,6 +110,10 @@ async def realtime(websocket: WebSocket, session_id: str):
     completed_streams = set()
     last_audio_received_ms = now_ms()
     received_audio_frame = False
+    reminder_repository = getattr(websocket.app.state, "reminders", None)
+    reminder_delivery = (ReminderDelivery(reminder_repository, session.user_id, f"{session_id}:{epoch}")
+                         if reminder_repository and session.user_id and session.owner_token_hash else None)
+    reminder_monitor = None
 
     async def send(kind, payload, turn_id=None, generation_id=None, source="gateway", trace_id=None, causation_id=None):
         """通过唯一写任务发送事件并继承所属轮次的因果标识。"""
@@ -105,6 +121,7 @@ async def realtime(websocket: WebSocket, session_id: str):
 
     async def send_state(turn_id=None, generation_id=None):
         """报告实际轮次观测，而非把模型结束误报为播放结束。"""
+        session.sync_social_state()
         state = session.turn.snapshot().model_dump()
         await send("turn.state", {"state": state.pop("mode"), **state}, turn_id, generation_id)
 
@@ -179,8 +196,15 @@ async def realtime(websocket: WebSocket, session_id: str):
                     previous = [item for item in session.outputs.values() if item.generation_id != generation_id]
                     if previous:
                         session.interruption = session.snapshot_interruption(previous[-1])
-            runtime_context = {"social_state": session.social_snapshot(text, intent).model_dump(),
+            snapshot = session.social_snapshot(text, intent)
+            compact = session.social_state.to_agent_context(snapshot)
+            session.trace.record("social_state.frozen", record.trace_id,
+                                 {"generation_id": generation_id, "state_version": snapshot.version})
+            runtime_context = {"social_state": {"session_id": snapshot.session_id, "user_id": snapshot.user_id,
+                                                "version": snapshot.version, "intent": intent.model_dump()},
+                               "social_context": compact.model_dump(mode="json"),
                                "turn_id": turn_id,
+                               "request_received_at": datetime.fromtimestamp(record.created_at, timezone.utc).isoformat(),
                                "interruption_state": session.interruption.model_dump() if session.interruption else None,
                                "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None,
                                "active_plan": session.active_plan.model_dump(mode="json") if session.active_plan and intent.continues_pending else None,
@@ -212,6 +236,8 @@ async def realtime(websocket: WebSocket, session_id: str):
                     return
                 kind, payload = item["type"], item["payload"]
                 if kind == "memory.result":
+                    session.social_state.emit(session_id, "health.updated", HealthState(
+                        component="memory", status="degraded" if payload["status"] == "failed" else "ok"), source="health")
                     if payload.get("cleared"):
                         # 删除通知先于确认回复发送，避免清空刚生成的确认消息。
                         while session.memory_notifications:
@@ -225,6 +251,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                     session.active_plan = plan.model_copy(deep=True) if plan.status in {"running", "waiting_input"} else None
                     session.pending_clarification = (PendingClarification.model_validate(payload["pending"])
                                                      if payload.get("pending") else None)
+                    session.sync_social_state()
                     for step in plan.steps:
                         if step.result and not any(result.call_id == step.result.call_id for result in record.tool_results):
                             record.tool_results.append(step.result.model_copy(deep=True))
@@ -235,10 +262,14 @@ async def realtime(websocket: WebSocket, session_id: str):
                 if kind == "tool.pending":
                     session.pending_clarification = (PendingClarification.model_validate(payload["pending"])
                                                      if payload["pending"] else None)
+                    session.sync_social_state()
                     continue
                 if kind == "tool.result":
                     record.tool_result = ToolResult.model_validate(payload["result"])
                     result = record.tool_result
+                    session.social_action(ActionState(
+                        action_id=result.call_id, kind="tool", generation_id=generation_id, turn_id=turn_id,
+                        name=result.tool_name, status=result.status, verified=result.verified))
                     if not any(item.call_id == result.call_id for item in record.tool_results):
                         record.tool_results.append(result.model_copy(deep=True))
                     session.trace.record("tool.completed", record.trace_id,
@@ -249,6 +280,9 @@ async def realtime(websocket: WebSocket, session_id: str):
                                           "error_code": result.error.code if result.error else None})
                     continue
                 if kind == "tool.started":
+                    session.social_action(ActionState(
+                        action_id=payload["call_id"], kind="tool", generation_id=generation_id,
+                        turn_id=turn_id, name=payload["tool_name"], status="running"))
                     session.trace.record(kind, record.trace_id, {"generation_id": generation_id, **payload})
                     continue
                 if kind == "behavior.plan":
@@ -272,6 +306,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                 return
             record.synthesis_complete = True
             session.turn.generating = False
+            session.sync_social_state()
             session.trace.record("generation.finished", record.trace_id, {"generation_id": generation_id})
             await delivered()
         except asyncio.CancelledError:
@@ -303,6 +338,11 @@ async def realtime(websocket: WebSocket, session_id: str):
 
     async def submit_turn(text, turn_id, trace_id=None, source="text"):
         """保存最终输入，明确控制短句走快捷路径，其余进入同一个 Agent。"""
+        received_at = datetime.now(timezone.utc).timestamp()
+        # 同一会话的轮次标识不能重新触发业务写入；不同文本复用也拒绝。
+        if any(item.turn_id == turn_id for item in session.outputs.values()):
+            await send("error", {"code": "duplicate_turn", "message": "此轮次已提交，请查看原回复或提醒列表。"}, turn_id)
+            return
         action = control_action(text)
         if action == "stop":
             session.cancel_plan()
@@ -319,7 +359,8 @@ async def realtime(websocket: WebSocket, session_id: str):
         if action == "repeat" and session.interruption is None and session.outputs:
             session.interruption = session.snapshot_interruption(next(reversed(session.outputs.values())))
         generation_id = str(uuid4())
-        session.begin_generation(generation_id, turn_id, text, trace_id or turn_id, settings.tts_ready)
+        record = session.begin_generation(generation_id, turn_id, text, trace_id or turn_id, settings.tts_ready, source)
+        record.created_at = received_at
         await send("turn.state", {"state": "received", "user_speaking": False,
                                 "robot_playing": False, "continuous": session.turn.continuous}, turn_id, generation_id)
         task = asyncio.create_task(bounded_generate(text, turn_id, generation_id, source))
@@ -337,7 +378,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                 stream = await asyncio.to_thread(websocket.app.state.speech_service.create_stream, stream_id)
             await send("turn.state", {"state": "listening", "audio_ready": True,
                                     "stream_id": stream_id, "continuous": continuous}, turn_id, trace_id=trace_id)
-            while session.connection_epoch == epoch:
+            while session.connection_epoch == epoch and not session.closed:
                 try:
                     async with asyncio.timeout(.05):
                         frame = await queue.get()
@@ -353,6 +394,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                         end_ms = payload.get("end_ms", start_ms)
                         confirmed = session.turn.vad(phase, start_ms, end_ms, payload.get("p_speech", 0),
                                                      payload.get("echo_likelihood"), payload.get("clipping_ratio", 0))
+                        session.sync_social_state()
                         session.trace.record(kind, trace_id, payload)
                         if confirmed and session.generation_id:
                             start = session.turn.candidate_start_ms
@@ -376,6 +418,9 @@ async def realtime(websocket: WebSocket, session_id: str):
             raise
         except Exception as exc:
             logger.exception("语音处理失败")
+            if not session.closed:
+                session.social_state.emit(session_id, "health.updated", HealthState(
+                    component="speech", status="degraded", reason="speech_error"), source="health")
             await send("error", {"code": "asr_error" if isinstance(exc, ASRError) else "speech_error",
                                 "message": str(exc) if isinstance(exc, (ASRError, ValueError)) else "语音处理失败，请重新开启麦克风。",
                                 "retryable": True}, turn_id, trace_id=trace_id)
@@ -389,6 +434,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                     completed_streams.pop()
                 session.turn.continuous = False
                 session.turn.user_speaking = False
+                session.sync_social_state()
                 try:
                     await send("audio.closed", {"stream_id": stream_id}, trace_id=trace_id)
                 except Exception:
@@ -424,11 +470,89 @@ async def realtime(websocket: WebSocket, session_id: str):
                     await cancel("playback_timeout")
                     await send("error", {"code": "playback_timeout", "message": "播放确认超时，已停止本轮输出。", "retryable": True})
 
+    async def speak_reminder(row, generation_id):
+        """固定提醒文案复用语段、取消和播放回执，不再次调用 Agent 或模型。"""
+        turn_id = "reminder:" + row["reminder_id"]
+        coordinator = None
+        try:
+            if session.generation_id != generation_id or session.connection_epoch != epoch:
+                return
+            async with asyncio.timeout(getattr(settings, "generation_timeout_ms", 120000) / 1000):
+                await send("reminder.speech", {"reminder_id": row["reminder_id"], "segment_id": "reminder_001"}, turn_id, generation_id)
+                if session.generation_id != generation_id or session.connection_epoch != epoch:
+                    return
+                segment = {"segment_id": "reminder_001", "index": 1, "text": notification_text(row)}
+                session.register_segment(generation_id, segment)
+                record = session.outputs[generation_id]
+                # 只有浏览器展示回执后才会进入此路径，因此字幕事实已有依据。
+                record.segments["reminder_001"].displayed = True
+                record.response_complete = True
+
+                async def send_reminder_output(kind, payload):
+                    """沿用同一代次过滤迟到语音，用户输入和停止可以立即打断。"""
+                    if session.generation_id == generation_id and session.connection_epoch == epoch:
+                        await send(kind, payload, turn_id, generation_id, "tts")
+
+                coordinator = OutputCoordinator(session, generation_id, websocket.app.state.tts, send_reminder_output,
+                                                buffer_ms=getattr(settings, "output_buffer_ms", 15000))
+                await coordinator.submit(segment, "neutral")
+                await coordinator.finish()
+                if session.generation_id == generation_id:
+                    record.synthesis_complete = True
+                    session.turn.generating = False
+                    await delivered()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if session.generation_id == generation_id:
+                await cancel("reminder_speech_failed")
+        finally:
+            if coordinator:
+                await coordinator.close()
+            if session.generation_task is asyncio.current_task():
+                session.generation_task = None
+
+    def reminder_idle():
+        """完整复核连接和交互空闲条件，数据库等待后也不得覆盖新输入或采集。"""
+        return (session.connection_epoch == epoch and websocket.app.state.sessions.get(session_id) is session
+                and session.generation_id is None and not session.turn.user_speaking
+                and not session.turn.generating and not session.turn.robot_playing
+                and session.pending_clarification is None and not (audio_task and not audio_task.done()))
+
+    async def monitor_reminders():
+        """在线扫描不进入首音路径；离线记录留在 SQLite，连接恢复后补发。"""
+        while session.connection_epoch == epoch:
+            try:
+                for row in await reminder_delivery.poll():
+                    if session.connection_epoch != epoch:
+                        return
+                    await send("reminder.due", row, source="reminders")
+                if settings.tts_ready and reminder_idle():
+                    row = await reminder_delivery.next_speech()
+                    # 数据库等待期间可能收到新输入；此时保留队列，不能覆盖新输出。
+                    if row and not reminder_idle():
+                        reminder_delivery.speech[row["reminder_id"]] = row
+                    elif row:
+                        generation_id = str(uuid4())
+                        session.begin_generation(generation_id, "reminder:" + row["reminder_id"], "", speech_enabled=True)
+                        task = asyncio.create_task(speak_reminder(row, generation_id))
+                        generation_tasks.add(task)
+                        task.add_done_callback(generation_tasks.discard)
+                        session.generation_task = task
+            except Exception as exc:
+                # 后台存储失败不影响实时输入；不记录事项或底层异常内容。
+                if isinstance(exc, (RuntimeError, ConnectionError)):
+                    return
+                logger.warning("提醒投递暂时不可用")
+            await asyncio.sleep(1)
+
     monitor = asyncio.create_task(watchdog())
     try:
         await send("session.status", {"status": "connected", "llm_ready": settings.llm_ready,
                                 "tts_ready": settings.tts_ready, "speech_ready": websocket.app.state.speech_service.ready,
                                 "full_duplex_supported": getattr(settings, "full_duplex_enabled", True)})
+        if reminder_delivery:
+            reminder_monitor = asyncio.create_task(monitor_reminders())
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
@@ -448,7 +572,13 @@ async def realtime(websocket: WebSocket, session_id: str):
                 await send("error", {"code": "invalid_event", "message": "实时事件格式、顺序或连接代次无效。"})
                 continue
             kind, payload = incoming.type, incoming.payload
-            if kind == "input.text":
+            if kind == "reminder.displayed":
+                if reminder_delivery:
+                    try:
+                        await reminder_delivery.acknowledge(payload.reminder_id, payload.delivery_token)
+                    except Exception:
+                        logger.warning("提醒展示回执暂时无法保存，将重新投递")
+            elif kind == "input.text":
                 text = payload.text.strip()
                 if not text:
                     await send("error", {"code": "invalid_text", "message": "请输入非空文本。"})
@@ -463,6 +593,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                     await send("error", {"code": "audio_unavailable", "message": "语音输入尚未就绪，或当前模式不支持同时录音与播放。"})
                     continue
                 session.turn.configure(payload.continuous and getattr(settings, "full_duplex_enabled", True), payload.aec_mode)
+                session.sync_social_state()
                 session.trace.record("audio.configured", incoming.trace_id,
                                      {"continuous": session.turn.continuous, "aec_mode": payload.aec_mode}, incoming.event_id)
                 audio_stream_id = payload.stream_id
@@ -526,6 +657,8 @@ async def realtime(websocket: WebSocket, session_id: str):
         pass
     finally:
         monitor.cancel()
+        if reminder_monitor:
+            reminder_monitor.cancel()
         if audio_task and not audio_task.done():
             audio_task.cancel()
         if session.connection_epoch == epoch:
@@ -534,6 +667,8 @@ async def realtime(websocket: WebSocket, session_id: str):
             task = session.generation_task
             session.cancel_generation("disconnect")
             session.turn.disconnected = True
+            if websocket.app.state.sessions.get(session_id) is session:
+                session.sync_social_state()
         else:
             task = None
         # 每个连接回收自己启动的任务；接管不能丢失已取消旧生成的引用。
@@ -541,7 +676,12 @@ async def realtime(websocket: WebSocket, session_id: str):
         for owned in owned_tasks:
             if not owned.done():
                 owned.cancel()
-        await asyncio.gather(*(item for item in (monitor, audio_task, task, *owned_tasks) if item), return_exceptions=True)
+        await asyncio.gather(*(item for item in (monitor, reminder_monitor, audio_task, task, *owned_tasks) if item), return_exceptions=True)
+        if reminder_delivery:
+            try:
+                await reminder_delivery.close()
+            except Exception:
+                logger.warning("提醒连接租约释放失败，将等待租约过期")
         await sender.close()
 
 
