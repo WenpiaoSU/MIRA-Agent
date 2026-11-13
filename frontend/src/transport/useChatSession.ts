@@ -7,10 +7,11 @@
  * - 以实际播放开始与媒体时钟驱动角色，断线后有界重连。
  * - 记忆删除后清空本地对话正文和待展示缓存，保留当前删除确认的输出位置。
  * - 去重到期提醒并在 React 展示后确认，空闲提醒语音复用现有播放器和停止链路。
+ * - 接收可恢复的冲突快照，提交版本绑定决定，报告失败并允许幂等重试。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { BehaviorPlan, PlaybackFeedbackPayload, ServerEvent, TtsChunkPayload } from '../contracts/realtime';
+import type { BehaviorPlan, PlaybackFeedbackPayload, ServerEvent, TtsChunkPayload, PendingMemoryOffer, MemoryResolutionAction } from '../contracts/realtime';
 import { AudioPlayer, type AudioSegment, type PlaybackState, type PlaybackClock } from '../audio/player';
 import { MicrophoneCapture, type CapturedFrame } from '../capture/microphone';
 
@@ -34,6 +35,11 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
   const [speaking, setSpeaking] = useState(false);
   const [mouthLevel, setMouthLevel] = useState(0);
   const [audioActive, setAudioActive] = useState(false);
+  const [memoryPending, setMemoryPending] = useState<PendingMemoryOffer[]>([]);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryNotice, setMemoryNotice] = useState('');
+  const [memoryError, setMemoryError] = useState('');
+  const memorySubmitting = useRef(false);
   const socket = useRef<WebSocket | null>(null);
   const sessionId = useRef<string | null>(null);
   const connectionEpoch = useRef(0);
@@ -69,6 +75,53 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
   const sendEvent = useCallback((type: string, payload: Record<string, unknown>) => {
     if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify(envelope(type, payload)));
   }, [envelope]);
+
+  /** 卡片真实展示后绑定当前连接的唯一问题，列表到达本身不代表已显示。 */
+  const acknowledgeMemory = useCallback((offer: PendingMemoryOffer, shown = true) => {
+    sendEvent(shown ? 'memory.pending.displayed' : 'memory.pending.hidden', { pending_id: offer.pending_id,
+      target_version: offer.target_version, delivery_token: offer.delivery_token });
+  }, [sendEvent]);
+
+  /** 按服务器候选快照提交明确选择，网络不明时保留卡片供同一决定幂等重试。 */
+  const resolveMemory = useCallback(async (offer: PendingMemoryOffer, action: MemoryResolutionAction) => {
+    if (memorySubmitting.current || socket.current?.readyState !== WebSocket.OPEN) return;
+    const epoch = connectionEpoch.current;
+    const ownerSession = sessionId.current;
+    memorySubmitting.current = true;
+    setMemoryBusy(true);
+    setMemoryError('');
+    setMemoryNotice('');
+    try {
+      const response = await fetch('/v1/memories/pending/' + encodeURIComponent(offer.pending_id) + '/resolve', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, target_version: offer.target_version }),
+      });
+      const result = await response.json() as { message?: string; detail?: string };
+      if (connectionEpoch.current !== epoch || sessionId.current !== ownerSession) return;
+      if (!response.ok) {
+        setMemoryError(result.detail || '记忆处理未确认完成，请重试同一选择。');
+        if ([404, 409, 410].includes(response.status)) {
+          const refreshed = await fetch('/v1/memories/pending', { credentials: 'same-origin' });
+          if (refreshed.ok && connectionEpoch.current === epoch && sessionId.current === ownerSession) {
+            const snapshot = await refreshed.json() as { pending: PendingMemoryOffer[] };
+            // HTTP 快照没有连接展示令牌，等待 WebSocket 刷新后再建立短答授权。
+            setMemoryPending(previous => snapshot.pending.map(item => ({ ...item, delivery_token:
+              previous.find(old => old.pending_id === item.pending_id && old.target_version === item.target_version)?.delivery_token || '' })));
+          }
+        }
+        return;
+      }
+      setMemoryPending(previous => previous.filter(item => item.pending_id !== offer.pending_id));
+      setMemoryNotice(result.message || '该条待确认记忆已处理。');
+    } catch {
+      if (connectionEpoch.current === epoch && sessionId.current === ownerSession) {
+        setMemoryError('处理结果未确认，请重试同一选择。');
+      }
+    } finally {
+      memorySubmitting.current = false;
+      setMemoryBusy(false);
+    }
+  }, []);
 
   /** React 提交字幕后再确认展示，避免把仅入队的更新记成已显示。 */
   useEffect(() => {
@@ -168,6 +221,9 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
       pendingReminders.current.clear();
       setInteractionState('disconnected');
       setTranscript('');
+      setMemoryPending([]);
+      setMemoryError('');
+      setMemoryNotice('');
       setMessages(previous => previous.map(item => ({ ...item, pending: false })));
     };
 
@@ -216,6 +272,19 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
           if (event.connection_epoch !== connectionEpoch.current) return;
           serverSeq.current = event.seq;
           const generationId = event.generation_id;
+          if (event.type === 'memory.pending') {
+            const rows = event.payload.pending;
+            if (Array.isArray(rows)) {
+              setMemoryPending(rows.filter(item => item && typeof item.pending_id === 'string'
+                && typeof item.question === 'string' && typeof item.candidate?.content === 'string') as PendingMemoryOffer[]);
+            }
+            return;
+          }
+          if (event.type === 'memory.updated') {
+            setMemoryPending([]);
+            setMemoryNotice('长期记忆已更新。');
+            return;
+          }
           if (event.type === 'reminder.due') {
             const { reminder_id: id, delivery_token: token, text } = event.payload;
             if (typeof id !== 'string' || typeof token !== 'string' || typeof text !== 'string' || !text) return;
@@ -239,6 +308,9 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
             return;
           }
           if (event.type === 'memory.cleared') {
+            setMemoryPending([]);
+            setMemoryError('');
+            setMemoryNotice('');
             displayed.current.clear();
             pendingDisplay.current.clear();
             setTranscript('');
@@ -471,6 +543,7 @@ export function useChatSession(onBehavior: (plan: BehaviorPlan | null) => void) 
   }, [sendEvent, stopAudio]);
 
   return { messages, status, error, ttsReady, speechReady, speechBusy, recording, transcript, duplexReady,
+    memoryPending, memoryBusy, memoryNotice, memoryError, resolveMemory, acknowledgeMemory,
     interactionState, speaking, mouthLevel, audioActive, audioClock, send, stop, toggleMicrophone };
 }
 

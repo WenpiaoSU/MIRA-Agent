@@ -3,6 +3,8 @@
 当前功能：
 - Cookie 验证用户归属，支持查看有效记录和历史版本。
 - 按单条事实或全部记忆执行删除，并同步清除会话派生缓存。
+- 独立查看和删除待确认候选，候选不作为有效记忆返回。
+- 接收与具体版本绑定的采纳/保留决定，返回数据库的幂等处理回执。
 """
 
 import sqlite3
@@ -10,7 +12,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 
-from src.contracts.memory import MemoryCandidate
+from src.contracts.memory import MemoryCandidate, MemoryResolution
 from src.gateway.identity import COOKIE_NAME
 
 
@@ -40,6 +42,39 @@ async def list_memories(request: Request, historical: bool = False):
         return {"records": [record.model_dump() for record in records]}
     except (sqlite3.Error, OSError):
         raise HTTPException(503, "记忆存储暂时不可用") from None
+
+
+@router.get("/pending")
+async def list_pending(request: Request):
+    """查看当前用户尚未过期的冲突候选及证据。"""
+    service, user_id = await owner(request)
+    try:
+        return {"pending": await service.repository.pending(user_id)}
+    except (sqlite3.Error, OSError):
+        raise HTTPException(503, "待确认记忆暂时不可用") from None
+
+
+@router.delete("/pending/{pending_id}")
+async def delete_pending(pending_id: str, request: Request):
+    """删除本人的待确认候选，不改变已确认事实。"""
+    service, user_id = await owner(request)
+    try:
+        if not await service.repository.delete_pending(user_id, pending_id):
+            raise HTTPException(404, "未找到待确认候选")
+        return {"status": "deleted"}
+    except (sqlite3.Error, OSError):
+        raise HTTPException(503, "删除未确认完成") from None
+
+
+@router.post("/pending/{pending_id}/resolve")
+async def resolve_memory(pending_id: str, decision: MemoryResolution, request: Request):
+    """确认本人指定候选，正文和归属从服务器快照读取，禁止请求重新指定。"""
+    service, user_id = await owner(request)
+    result = await service.resolve(user_id, pending_id, decision, evidence="界面明确选择：" + decision.action)
+    code = {"not_found": 404, "expired": 410, "conflict": 409, "failed": 503}.get(result.status)
+    if code:
+        raise HTTPException(code, result.message)
+    return result.model_dump()
 
 
 async def remove(request: Request, memory_id: str | None):

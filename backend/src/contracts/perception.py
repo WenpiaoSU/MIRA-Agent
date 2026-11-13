@@ -1,10 +1,10 @@
 """作用：定义已提交轮次的意图识别结果。
 
 当前功能：
-- 约束七类意图、控制动作、参数值与文本证据。
+- 约束五类意图、控制动作、参数值与文本证据。
 - 校验互斥字段、缺失参数和重复槽位，防止非法结果进入路由。
 - 显式区分补充待澄清请求与发起新的工具请求。
-- 标记需要多步规划的组合任务，维持现有七类意图。
+- 标记需要多步规划的组合任务。
 """
 
 from typing import Literal, Self
@@ -12,7 +12,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
-IntentName = Literal["chat", "question", "tool_request", "memory_query", "memory_update", "control", "other"]
+IntentName = Literal["chat", "question", "tool_request", "control", "other"]
 ControlAction = Literal["stop", "cancel", "repeat", "resume", "change_topic"]
 
 

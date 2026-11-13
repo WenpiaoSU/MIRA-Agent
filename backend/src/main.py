@@ -7,7 +7,7 @@
 - 注入本地 SileroVAD 与 ASR API 组成的语音服务。
 - 装配有界意图识别、时间工具及可关闭的单一来源天气工具。
 - 注入有界任务规划与时间转换工具，支持不同工具之间的字段依赖。
-- 装配 Checkpointer 短期记忆与 SQLite 长期记忆，启动故障保留普通对话能力。
+- 装配持久化短期检查点、分级长期门控及异步整合的生命周期。
 - 在同一 SQLite 装配一次性提醒工具和浏览器投递所需存储。
 - 将配置化的 M08 状态服务注入现有会话注册表。
 """
@@ -15,6 +15,8 @@
 from fastapi import FastAPI
 import logging
 import sqlite3
+import asyncio
+from contextlib import asynccontextmanager
 
 from src.agent.graph import AgentGraph
 from src.agent.planner import TaskPlanner
@@ -41,7 +43,30 @@ from src.social_state import SocialStateConfig, SocialStateService
 
 def create_app() -> FastAPI:
     """组装后端依赖和路由，返回可由 ASGI 服务器运行的应用。"""
-    app = FastAPI(title="MIRA Agent", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app):
+        """启动整合和 TTL 维护，退出时取消后台任务并关闭检查点连接。"""
+        async def maintain():
+            """无用户输入时仍按固定周期清理过期短期状态。"""
+            while True:
+                await asyncio.sleep(30)
+                await asyncio.to_thread(working.expire)
+        cleanup = asyncio.create_task(maintain(), name="memory-retention")
+        if app.state.memory:
+            app.state.memory.start()
+        try:
+            yield
+        finally:
+            cleanup.cancel()
+            try:
+                await cleanup
+            except asyncio.CancelledError:
+                pass
+            if app.state.memory:
+                await app.state.memory.close()
+            working.close()
+
+    app = FastAPI(title="MIRA Agent", version="0.1.0", lifespan=lifespan)
     settings = Settings()
     app.state.settings = settings
     app.state.social_state = SocialStateService(SocialStateConfig(
@@ -57,7 +82,12 @@ def create_app() -> FastAPI:
     app.state.tool_registry = registry
     app.state.tool_executor = ToolExecutor(registry, settings.tool_timeout_ms)
     app.state.task_planner = TaskPlanner(provider, settings.plan_max_steps, settings.plan_timeout_ms)
-    working = WorkingMemory(settings.working_memory_ttl_seconds)
+    try:
+        working = WorkingMemory(settings.working_memory_ttl_seconds, settings.checkpoint_db_path,
+                                settings.working_memory_token_threshold, settings.memory_timeout_ms)
+    except (sqlite3.Error, OSError):
+        logging.getLogger(__name__).warning("检查点文件不可用，降级为临时 SQLite 会话状态")
+        working = WorkingMemory(settings.working_memory_ttl_seconds, token_threshold=settings.working_memory_token_threshold)
     app.state.memory = None
     app.state.database = None
     app.state.reminders = None
@@ -66,8 +96,10 @@ def create_app() -> FastAPI:
             repository = MemoryRepository(settings.memory_db_path)
             app.state.database = repository
             if settings.memory_enabled:
-                app.state.memory = MemoryService(repository, provider, settings.memory_timeout_ms)
+                app.state.memory = MemoryService(repository, provider, settings.memory_timeout_ms,
+                                                  settings.memory_job_ttl_seconds, settings.memory_queue_limit)
                 app.state.memory.on_delete = app.state.sessions.forget_memories
+                app.state.memory.on_change = app.state.sessions.memories_changed
             if settings.reminders_enabled:
                 app.state.reminders = ReminderRepository(repository)
                 register_reminder_tools(registry, app.state.reminders, settings.default_timezone)

@@ -1,8 +1,8 @@
 """作用：验证结构化意图识别、实际路由和网关取消边界。
 
 当前功能：
-- 用固定模型输出检查七类契约、工具参数、文本证据和失败降级。
-- 验证确定性能力说明、会话记忆查询及句子级恢复分支。
+- 用固定模型输出检查五类契约、工具参数、文本证据和失败降级。
+- 验证确定性能力说明、独立会话记忆查询及句子级恢复分支。
 - 通过生产网关检查慢分类、停止、新轮次与旧结果隔离。
 - 检查上下文预算、无 ASR 置信度输入及脱敏轨迹。
 """
@@ -64,11 +64,10 @@ class ScriptedProvider:
 class IntentServiceTests(unittest.IsolatedAsyncioTestCase):
     """检查真实分类服务的契约与有界降级，不以模拟结果声称模型准确率。"""
 
-    async def test_seven_categories_and_input_without_asr_confidence(self):
-        """七类 JSON 能进入契约，传给模型的数据不包含 ASR 置信度。"""
+    async def test_five_categories_and_input_without_asr_confidence(self):
+        """五类 JSON 能进入契约，传给模型的数据不包含 ASR 置信度。"""
         cases = [("chat", "今天好累"), ("question", "为什么植物会停止生长？"),
-                 ("tool_request", "查杭州天气"), ("memory_query", "你记得我的研究方向吗"),
-                 ("memory_update", "我喜欢简短回答"), ("control", "刚才那段请重新讲讲"), ("other", "那个呢")]
+                 ("tool_request", "查杭州天气"), ("control", "刚才那段请重新讲讲"), ("other", "那个呢")]
         for name, text in cases:
             with self.subTest(intent=name):
                 output = estimate(name, control_action="repeat" if name == "control" else None)
@@ -186,10 +185,10 @@ class IntentServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_evidence_and_nullable_confidence_are_accepted(self):
         """允许可核实的近期指代和空置信度，不用任意阈值替代判断。"""
-        result = await IntentService(ScriptedProvider(estimate("memory_update", confidence=None, slots=[
+        result = await IntentService(ScriptedProvider(estimate("chat", confidence=None, slots=[
             {"name": "value", "value": "小苏", "evidence": "小苏"}]).model_dump())).classify(
                 "以后这样叫我", "用户：小苏", [], source="text")
-        self.assertEqual(result.intent, "memory_update")
+        self.assertEqual(result.intent, "chat")
         self.assertIsNone(result.confidence)
 
 
@@ -210,13 +209,13 @@ class IntentStateTests(unittest.TestCase):
     def test_snapshot_does_not_reuse_old_intent_and_trace_redacts_slots(self):
         """本轮快照深拷贝识别结果，后续快照不沿用，轨迹过滤正文。"""
         session = Session()
-        intent = estimate("memory_update", slots=[{"name": "value", "value": "私人内容", "evidence": "私人内容"}])
+        intent = estimate("chat", slots=[{"name": "value", "value": "私人内容", "evidence": "私人内容"}])
         snapshot = session.social_snapshot("私人内容", intent)
         intent.slots.clear()
         self.assertEqual(snapshot.intent.slots[0].value, "私人内容")
         self.assertIsNone(session.social_snapshot("下一轮").intent)
         trace = TraceRecorder()
-        trace.record("intent.classified", "t", {"intent": "memory_update", "elapsed_ms": 5,
+        trace.record("intent.classified", "t", {"intent": "chat", "elapsed_ms": 5,
                                                 "text": "私人内容", "slots": [{"value": "私人内容"}]})
         self.assertNotIn("私人内容", json.dumps(trace.report(), ensure_ascii=False))
 
@@ -237,7 +236,10 @@ class IntentGraphTests(unittest.IsolatedAsyncioTestCase):
         provider = ScriptedProvider(raw='{"expression":"neutral","gaze":"center","gesture":null,"intensity":0.6}\n回答内容。')
         graph = AgentGraph(provider)
         context = {"social_state": {"intent": intent.model_dump()}, "interruption_state": interruption}
-        events = [event async for event in graph.stream(text, history or [], [], "g", runtime_context=context)]
+        try:
+            events = [event async for event in graph.stream(text, history or [], [], "g", runtime_context=context)]
+        finally:
+            graph.working.close()
         return events, provider
 
     async def test_chat_and_question_have_different_routes_with_same_output(self):
@@ -250,9 +252,6 @@ class IntentGraphTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_tools_and_memory_are_deterministic(self):
         """未开放能力不调用回复模型，也不生成操作成功或天气结果。"""
         cases = [(estimate("tool_request"), "外部工具"),
-                 (estimate("memory_update"), "未进行持久保存"),
-                 (estimate("memory_update", slots=[{"name": "operation", "value": "delete", "evidence": "忘掉"}]), "未进行持久保存或删除"),
-                 (estimate("memory_query"), "没有找到可供核实的相关记忆记录"),
                  (IntentEstimate.uncertain(), "请换个说法")]
         for intent, expected in cases:
             with self.subTest(intent=intent):
@@ -262,7 +261,7 @@ class IntentGraphTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_memory_query_uses_only_user_history(self):
         """有会话历史时采用用户证据约束，不将模型推测视为长期事实。"""
-        _, provider = await self.run_graph(estimate("memory_query"), history=[{"role": "user", "content": "我的方向是 NLP"}])
+        _, provider = await self.run_graph(estimate("question"), text="你记得我的研究方向吗", history=[{"role": "user", "content": "我的方向是 NLP"}])
         self.assertIn("只依据长期记录和近期用户原文", provider.messages[0][0]["content"])
         self.assertEqual(provider.messages[0][1]["content"], "我的方向是 NLP")
 
@@ -339,7 +338,7 @@ class IntentGatewayTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await asyncio.sleep(10)
                 except asyncio.CancelledError:
-                    return estimate("memory_update")
+                    return estimate("chat")
             return estimate("question")
 
         self.app.state.intent_service = SimpleNamespace(classify=classify)

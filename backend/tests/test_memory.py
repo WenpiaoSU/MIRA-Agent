@@ -41,15 +41,26 @@ class MemoryProvider:
         self.messages = []
         self.started = asyncio.Event()
         self.block = False
+        self.relation = "conflict"
 
     async def stream(self, messages):
         """按系统提示区分提取与回答，测试不访问任何网络模型。"""
         self.messages.append(messages)
-        if "你负责提取一个长期记忆操作" in messages[0]["content"]:
+        prompt = messages[0]["content"]
+        if "你负责提取长期原子事实" in prompt or "解析本轮用户明确的长期记忆删除" in prompt:
             self.started.set()
             if self.block:
                 await asyncio.sleep(20)
-            yield self.candidate.model_dump_json()
+            if "删除请求" in prompt:
+                yield self.candidate.model_dump_json()
+            else:
+                yield json.dumps({"facts": [{"should_write": True, "memory_type": "preference",
+                    "content": self.candidate.content, "evidence": self.candidate.evidence,
+                    "confidence": .98, "is_temporary": False, "fact_key": self.candidate.fact_key}]}, ensure_ascii=False)
+        elif "比较一个新事实与候选历史事实" in prompt:
+            payload = json.loads(messages[1]["content"])
+            yield json.dumps({"relation": self.relation,
+                              "target_id": None if self.relation == "different" else payload["existing"][0]["memory_id"]})
         else:
             yield '{"expression":"neutral","gaze":"center","gesture":null,"intensity":0.6}\n根据已有记录回答。'
 
@@ -81,6 +92,8 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         """等待短事务清理后删除临时数据库。"""
+        await self.service.close()
+        self.agent.working.close()
         self.temp.cleanup()
 
     async def update(self, text="我喜欢简短回答", turn="t1"):
@@ -122,7 +135,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.update()).memory_ids, saved.memory_ids)
         self.provider.candidate = MemoryCandidate(action="remember", fact_key="user.reply_style",
                                                    content="我喜欢详细回答", evidence="我喜欢详细回答")
-        self.assertEqual((await self.update("我喜欢详细回答", "t2")).status, "clarify")
+        self.assertEqual((await self.update("我喜欢详细回答", "t2")).status, "pending")
         self.provider.candidate.action = "update"
         self.assertEqual((await self.update("我现在改为：我喜欢详细回答", "t3")).status, "saved")
         revision, versions = await self.repo.snapshot(self.user, historical=True)
@@ -152,16 +165,25 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_graph_cross_session_recall_and_state_reset(self):
         """写入后另一个会话可检索，上一轮的固定确认不能覆盖下一轮普通回答。"""
-        first = await self.turn("我喜欢简短回答", "memory_update")
+        first = await self.turn("记住：我喜欢简短回答")
         self.assertIn("已保存", first[-1]["payload"]["text"])
         self.assertEqual(len(self.provider.messages), 1)
         second = await self.turn("解释一下光合作用")
         self.assertEqual(second[-1]["payload"]["text"], "根据已有记录回答。")
         self.assertIn("我喜欢简短回答", self.provider.messages[-1][0]["content"])
         other = self.sessions.create(self.user)
-        await self.turn("你记得我的回答风格吗", "memory_query", other)
+        await self.turn("你记得我的回答风格吗", session=other)
         self.assertIn("我喜欢简短回答", self.provider.messages[-1][0]["content"])
         self.assertIn("source_turn_id", self.provider.messages[-1][0]["content"])
+
+    async def test_explicit_correction_is_independent_of_chat_classification(self):
+        """分类为普通交流时，独立记忆入口仍提交明确更正并返回真实确认。"""
+        await self.turn("记住：我喜欢简短回答")
+        self.provider.candidate = MemoryCandidate(action="remember", fact_key="user.reply_style",
+                                                  content="我喜欢详细回答", evidence="我喜欢详细回答")
+        result = await self.turn("现在把回答偏好改为：我喜欢详细回答")
+        self.assertIn("已保存或更新", result[-1]["payload"]["text"])
+        self.assertEqual((await self.repo.snapshot(self.user))[1][0].version, 2)
 
     async def test_checkpoint_is_memory_source_and_never_assumes_speech(self):
         """清空实时账本后检查点仍提供历史，未展示或未播放正文不冒充交付。"""
@@ -189,9 +211,9 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         for index in range(12):
             await self.turn(f"第 {index} 轮")
         history = self.agent.working.read(self.session.session_id)
-        self.assertLessEqual(len(history), 12)
+        self.assertLessEqual(self.agent.working.token_count(history), self.agent.working.token_threshold)
         checkpoints = list(self.agent.working.checkpointer.list({"configurable": {"thread_id": self.session.session_id}}))
-        self.assertLess(len(checkpoints), 15)
+        self.assertLessEqual(len(checkpoints), 64)
 
     async def test_expired_dialogue_is_not_rehydrated_from_output_ledger(self):
         """过期交付记录不能因仍在播放账本里而重新进入短期记忆。"""
@@ -212,25 +234,25 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delete_clears_all_user_context_and_prevents_resurrection(self):
         """删除清理当前用户全部会话缓存和版本，其他用户的检查点保持独立。"""
-        await self.turn("我喜欢简短回答", "memory_update")
+        await self.turn("记住：我喜欢简短回答")
         other = self.sessions.create(self.user)
         await self.turn("我也在这个窗口聊简短回答", session=other)
         stranger = self.sessions.create("other-user")
         await self.turn("另一个人的信息", session=stranger)
         self.provider.candidate = MemoryCandidate(action="delete", delete_all=True, evidence="忘掉我的全部记忆")
-        result = await self.turn("忘掉我的全部记忆", "memory_update")
+        result = await self.turn("忘掉我的全部记忆")
         self.assertIn("已删除", result[-1]["payload"]["text"])
         self.assertEqual((await self.repo.snapshot(self.user, historical=True))[1], [])
         self.assertEqual(self.agent.working.read(other.session_id), [])
         self.assertEqual(other.context_history(), [])
         self.assertTrue(self.agent.working.read(stranger.session_id))
-        await self.turn("之前聊过什么", "memory_query")
+        await self.turn("之前聊过什么")
         prompt = json.dumps(self.provider.messages[-1], ensure_ascii=False)
         self.assertNotIn("我喜欢简短回答", prompt)
 
     async def test_database_failure_does_not_claim_saved(self):
         """数据库提交失败返回明确失败，不产生虚假的保存确认。"""
-        self.repo.commit = AsyncMock(side_effect=sqlite3.OperationalError("locked"))
+        self.repo.integrate = AsyncMock(side_effect=sqlite3.OperationalError("locked"))
         result = await self.update()
         self.assertEqual(result.status, "failed")
         self.assertIn("未确认完成", result.message)
@@ -238,7 +260,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_read_is_distinct_from_empty_memory(self):
         """明确查询遇到数据库故障时报告无法核实，普通交流继续使用短期上下文。"""
         self.repo.snapshot = AsyncMock(side_effect=sqlite3.OperationalError("locked"))
-        queried = await self.turn("你记得我的偏好吗", "memory_query")
+        queried = await self.turn("你记得我的偏好吗")
         self.assertIn("无法读取", queried[-1]["payload"]["text"])
         chatted = await self.turn("你好")
         self.assertEqual(chatted[-1]["payload"]["text"], "根据已有记录回答。")
@@ -254,7 +276,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gateway_delete_notification_precedes_reply_and_recall(self):
         """实际 WebSocket 网关完成保存、删除和下一轮查询，且清理事件先于确认正文。"""
-        classifier = SimpleNamespace(classify=AsyncMock(return_value=intent("memory_update")))
+        classifier = SimpleNamespace(classify=AsyncMock(return_value=intent("chat")))
         app = SimpleNamespace(state=SimpleNamespace(
             sessions=self.sessions, agent=self.agent, memory=self.service, intent_service=classifier,
             settings=SimpleNamespace(llm_ready=True, tts_ready=False, stop_ack_timeout_ms=100),
@@ -263,7 +285,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(realtime(socket, self.session.session_id))
         try:
             await socket.until("session.status")
-            await socket.send("input.text", {"text": "我喜欢简短回答"}, "save")
+            await socket.send("input.text", {"text": "记住：我喜欢简短回答"}, "save")
             saved = await socket.until("response.completed")
             self.assertIn("已保存", saved["payload"]["text"])
             await socket.until("turn.delivered")
@@ -273,7 +295,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             deleted = await socket.until("response.completed")
             self.assertIn("已删除", deleted["payload"]["text"])
             await socket.until("turn.delivered")
-            classifier.classify.return_value = intent("memory_query")
+            classifier.classify.return_value = intent("question")
             await socket.send("input.text", {"text": "你记得我的回答偏好吗"}, "query")
             answer = await socket.until("response.completed")
             self.assertIn("没有找到", answer["payload"]["text"])

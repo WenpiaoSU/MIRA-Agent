@@ -12,6 +12,7 @@
 - 通过浏览器凭据验证会话归属，分类前同步 Checkpointer，并处理记忆删除通知。
 - 后台轮询一次性提醒并接收展示回执，空闲后使用现有 TTS 输出账本播报。
 - 将最终输入、意图、健康与执行摘要聚合到 M08，冻结紧凑状态供 Agent 使用。
+- 独立通知后台记忆冲突，验证展示回执，并将唯一候选短答交给 M10 确认。
 """
 
 import asyncio
@@ -26,7 +27,7 @@ from pydantic import ValidationError
 from src.agent.recovery import control_action
 from src.contracts.realtime import (
     AudioEndInput, AudioFrameInput, AudioStartInput, CommandAckInput, DisplayedInput,
-    PlaybackInput, StopInput, TextInput, ReminderAckInput,
+    PlaybackInput, StopInput, TextInput, ReminderAckInput, MemoryPendingAckInput,
 )
 from src.contracts.tools import PendingClarification, ToolResult
 from src.contracts.agent import TaskPlan
@@ -35,6 +36,8 @@ from src.evaluation.trace import now_ms
 from src.gateway.sender import EventSender
 from src.gateway.identity import owns_session
 from src.gateway.reminders import ReminderDelivery, notification_text
+from src.gateway.memories import MemoryPendingDelivery
+from src.contracts.perception import IntentEstimate
 from src.intent.service import build_context_summary
 from src.output.coordinator import OutputCoordinator
 from src.providers.llm import LLMError
@@ -50,6 +53,8 @@ INPUT_MODELS = {
     "control.stop": StopInput, "response.displayed": DisplayedInput,
     "command.ack": CommandAckInput,
     "reminder.displayed": ReminderAckInput,
+    "memory.pending.displayed": MemoryPendingAckInput,
+    "memory.pending.hidden": MemoryPendingAckInput,
     **{f"playback.{phase}": PlaybackInput for phase in ("started", "progress", "ended", "stopped", "failed", "paused")},
 }
 
@@ -114,6 +119,8 @@ async def realtime(websocket: WebSocket, session_id: str):
     reminder_delivery = (ReminderDelivery(reminder_repository, session.user_id, f"{session_id}:{epoch}")
                          if reminder_repository and session.user_id and session.owner_token_hash else None)
     reminder_monitor = None
+    memory_service = getattr(websocket.app.state, "memory", None)
+    memory_delivery = MemoryPendingDelivery(memory_service, session) if memory_service and session.user_id else None
 
     async def send(kind, payload, turn_id=None, generation_id=None, source="gateway", trace_id=None, causation_id=None):
         """通过唯一写任务发送事件并继承所属轮次的因果标识。"""
@@ -149,7 +156,7 @@ async def realtime(websocket: WebSocket, session_id: str):
                        record.turn_id, record.generation_id)
             await send_state(record.turn_id)
 
-    async def generate(text, turn_id, generation_id, source, deadline_at):
+    async def generate(text, turn_id, generation_id, source, deadline_at, memory_confirmation=None):
         """在可取消任务内完成分类与生成，不阻塞网关接收和 VAD。"""
         coordinator = None
         try:
@@ -173,7 +180,8 @@ async def realtime(websocket: WebSocket, session_id: str):
             classify_options = {"source": source}
             if pending:
                 classify_options["pending_clarification"] = pending.model_copy(deep=True)
-            intent = await websocket.app.state.intent_service.classify(text, summary, available_tools, **classify_options)
+            intent = (IntentEstimate.uncertain() if memory_confirmation else
+                      await websocket.app.state.intent_service.classify(text, summary, available_tools, **classify_options))
             # 即使提供者吞掉取消，旧分类结果也不能更新状态或开始输出。
             if session.generation_id != generation_id or session.connection_epoch != epoch:
                 return
@@ -209,6 +217,8 @@ async def realtime(websocket: WebSocket, session_id: str):
                                "pending_clarification": pending.model_dump() if pending and intent.continues_pending else None,
                                "active_plan": session.active_plan.model_dump(mode="json") if session.active_plan and intent.continues_pending else None,
                                "generation_deadline_at": deadline_at.isoformat()}
+            if memory_confirmation:
+                runtime_context["memory_confirmation"] = memory_confirmation.model_dump()
             if session.interruption:
                 interrupted_record = session.outputs.get(session.interruption.generation_id)
                 if interrupted_record and interrupted_record.task_plan:
@@ -324,12 +334,12 @@ async def realtime(websocket: WebSocket, session_id: str):
             if session.generation_task is asyncio.current_task():
                 session.generation_task = None
 
-    async def bounded_generate(text, turn_id, generation_id, source):
+    async def bounded_generate(text, turn_id, generation_id, source, memory_confirmation=None):
         """为分类、生成与合成设置整轮预算，超时走同一取消协议。"""
         try:
             async with asyncio.timeout(getattr(settings, "generation_timeout_ms", 120000) / 1000):
                 deadline_at = datetime.now(timezone.utc) + timedelta(milliseconds=getattr(settings, "generation_timeout_ms", 120000))
-                await generate(text, turn_id, generation_id, source, deadline_at)
+                await generate(text, turn_id, generation_id, source, deadline_at, memory_confirmation)
         except TimeoutError:
             if session.connection_epoch == epoch and session.generation_id == generation_id:
                 await cancel("generation_timeout")
@@ -339,6 +349,7 @@ async def realtime(websocket: WebSocket, session_id: str):
     async def submit_turn(text, turn_id, trace_id=None, source="text"):
         """保存最终输入，明确控制短句走快捷路径，其余进入同一个 Agent。"""
         received_at = datetime.now(timezone.utc).timestamp()
+        memory_confirmation = memory_delivery.consume(text) if memory_delivery else None
         # 同一会话的轮次标识不能重新触发业务写入；不同文本复用也拒绝。
         if any(item.turn_id == turn_id for item in session.outputs.values()):
             await send("error", {"code": "duplicate_turn", "message": "此轮次已提交，请查看原回复或提醒列表。"}, turn_id)
@@ -363,7 +374,7 @@ async def realtime(websocket: WebSocket, session_id: str):
         record.created_at = received_at
         await send("turn.state", {"state": "received", "user_speaking": False,
                                 "robot_playing": False, "continuous": session.turn.continuous}, turn_id, generation_id)
-        task = asyncio.create_task(bounded_generate(text, turn_id, generation_id, source))
+        task = asyncio.create_task(bounded_generate(text, turn_id, generation_id, source, memory_confirmation))
         generation_tasks.add(task)
         task.add_done_callback(generation_tasks.discard)
         session.generation_task = task
@@ -442,6 +453,7 @@ async def realtime(websocket: WebSocket, session_id: str):
 
     async def watchdog():
         """检查连接所有权和有界播放等待，异常时清理而非永久卡住。"""
+        next_memory_poll = 0
         while True:
             await asyncio.sleep(.25)
             if (session.connection_epoch != epoch or websocket.app.state.sessions.get(session_id) is not session
@@ -450,7 +462,17 @@ async def realtime(websocket: WebSocket, session_id: str):
                 return
             while session.memory_notifications:
                 notification = session.memory_notifications.pop(0)
+                if memory_delivery and notification["type"] in {"memory.cleared", "memory.updated"}:
+                    memory_delivery.invalidate()
                 await send(notification["type"], notification["payload"], generation_id=notification["generation_id"])
+            if memory_delivery and now_ms() >= next_memory_poll:
+                next_memory_poll = now_ms() + 2000
+                try:
+                    snapshot = await memory_delivery.poll()
+                    if snapshot is not None:
+                        await send("memory.pending", snapshot)
+                except Exception:
+                    logger.warning("待确认记忆通知暂时不可用")
             for old in list(session.outputs.values()):
                 if (old.status == "cancelled" and not old.stop_confirmed and not old.stop_timed_out
                         and now_ms() - old.cancelled_at_ms > session.stop_ack_timeout_ms):
@@ -572,7 +594,13 @@ async def realtime(websocket: WebSocket, session_id: str):
                 await send("error", {"code": "invalid_event", "message": "实时事件格式、顺序或连接代次无效。"})
                 continue
             kind, payload = incoming.type, incoming.payload
-            if kind == "reminder.displayed":
+            if kind == "memory.pending.displayed":
+                if memory_delivery:
+                    memory_delivery.acknowledge(payload)
+            elif kind == "memory.pending.hidden":
+                if memory_delivery:
+                    memory_delivery.hide(payload)
+            elif kind == "reminder.displayed":
                 if reminder_delivery:
                     try:
                         await reminder_delivery.acknowledge(payload.reminder_id, payload.delivery_token)

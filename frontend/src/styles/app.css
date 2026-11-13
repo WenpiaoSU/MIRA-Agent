@@ -4,10 +4,13 @@
  * - 定义机器人空间、聊天面板和 Avatar 工作台的样式。
  * - 定义角色画布、状态提示和较窄视口下的布局。
  * - 标识正在录音的麦克风与尚未确认的语音字幕。
+ * - 展示空闲时的记忆冲突卡及采纳、保留和处理反馈。
  */
 
 /* 引入页面文字使用的字体。 */
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+/* 冲突信息保持原文可读，较长候选允许聊天面板随内容展开。 */
+.memory-confirmation-area{flex-shrink:0}.memory-conflict{margin:8px 0;padding:14px;background:#f7f5ff;border:1px solid #ddd7f6;border-radius:10px;font-size:13px;color:#3f3b55}.memory-conflict-heading{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px}.memory-conflict-heading span{font-size:11px;color:#726b86}.memory-conflict dl{margin:12px 0}.memory-conflict dl>div{display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;margin:7px 0}.memory-conflict dt{color:#726b86}.memory-conflict dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.memory-conflict p{margin:10px 0}.memory-conflict-actions{display:flex;flex-wrap:wrap;gap:8px}.memory-conflict-actions button:disabled{opacity:.6;cursor:wait}.memory-feedback{font-size:12px;padding:6px 2px;color:#4e655a;overflow-wrap:anywhere}.memory-feedback-error{color:#a83c50}.conversation:has(.memory-conflict){height:auto;min-height:440px}.conversation:has(.memory-conflict) .chat-body{flex:none;max-height:280px;min-height:120px}
 /* 角色画布和聊天错误信息的基础样式。 */
 .live2d-mount canvas{width:100%!important;height:100%!important}.preview-model{width:350px;height:350px}.home-live2d{min-height:250px}
 .chat-error{font-size:10px;color:#bb4c58;padding:5px 8px}.send-button:disabled{opacity:.45;cursor:not-allowed}.chat-body .bubble{white-space:pre-wrap;overflow-wrap:anywhere}

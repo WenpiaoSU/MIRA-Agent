@@ -7,6 +7,7 @@
 - 定义单个完整 WAV 语段的 TTS 输出负载。
 - 生成带时间戳、序号和追踪标识的服务端事件。
 - 校验提醒展示回执，区分通知展示与语音播报。
+- 校验待确认记忆问题的连接专属展示凭据。
 """
 
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 from src.contracts.reminders import ReminderAckPayload
+from src.contracts.memory import MemoryPendingAck
 
 
 class TimeRef(BaseModel):
@@ -61,6 +63,12 @@ class TextInput(ClientEnvelope):
     type: Literal["input.text"]
     turn_id: str
     payload: TextPayload
+
+
+class MemoryPendingAckInput(ClientEnvelope):
+    """回报候选问题的展示或隐藏，不能凭未知 ID 或其他连接令牌建立授权。"""
+    type: Literal["memory.pending.displayed", "memory.pending.hidden"]
+    payload: MemoryPendingAck
 
 
 class AudioStartPayload(BaseModel):

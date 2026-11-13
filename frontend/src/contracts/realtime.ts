@@ -4,6 +4,7 @@
  * - 约束后端行为计划的表情、视线和动作字段。
  * - 约束完整语段 TTS 音频和播放反馈字段。
  * - 约束 WebSocket 的连接、追踪、取消和实际交付事件。
+ * - 定义版本绑定的待确认记忆快照和明确处理动作。
  */
 
 /** 后端发送给角色渲染层的单轮语义行为计划。 */
@@ -60,3 +61,20 @@ export type ServerEvent = {
   causation_id: string | null;
   payload: Record<string, unknown>;
 };
+
+/** 后台冲突通知只携带已验证候选，不能直接作为有效长期事实使用。 */
+export type PendingMemoryOffer = {
+  pending_id: string;
+  target_id: string | null;
+  target_version: number | null;
+  target_content: string;
+  candidate: { content: string; evidence: string; domain_scope: string; memory_type: string };
+  reason: string;
+  question: string;
+  created_at: string;
+  expires_at: number;
+  delivery_token: string;
+};
+
+/** 用户决定只选择已展示快照，不能由前端改写候选正文或事实键。 */
+export type MemoryResolutionAction = 'accept_new' | 'keep_old';

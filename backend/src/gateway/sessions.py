@@ -9,6 +9,7 @@
 - 保存一个待澄清工具请求和有界结果账本，控制请求不重新执行查询。
 - 保存一个活跃任务计划，并在取消或连接接管时终止剩余步骤。
 - 按浏览器身份隔离长期记忆；删除后清除相关交付缓存并通知各连接。
+- 采纳冲突候选后撤销旧派生状态和生成，保留原始聊天记录。
 """
 
 import asyncio
@@ -404,4 +405,21 @@ class SessionRegistry:
                 self.forget_checkpoint(session.session_id)
             session.social_state.emit(session.session_id, "memory.cleared", source="memory")
             session.memory_notifications.append({"type": "memory.cleared", "payload": {}, "generation_id": None})
+
+    def memories_changed(self, user_id: str, current_session: str = "", current_generation: str = ""):
+        """采纳新事实后撤销旧派生上下文，保留聊天原文和本次确认输出。"""
+        for session in self.sessions.values():
+            if session.user_id != user_id:
+                continue
+            current = session.session_id == current_session and session.generation_id == current_generation
+            if not current:
+                old = session.cancel_generation("memory_updated")
+                if old:
+                    session.memory_notifications.append({"type": "output.cancel", "payload": session.cancel_payload(old), "generation_id": old})
+            session.cancel_plan()
+            session.pending_clarification = None
+            session.interruption = None
+            if self.forget_checkpoint:
+                self.forget_checkpoint(session.session_id)
+            session.memory_notifications.append({"type": "memory.updated", "payload": {}, "generation_id": None})
 

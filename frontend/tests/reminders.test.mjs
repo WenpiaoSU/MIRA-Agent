@@ -3,6 +3,7 @@
  * 当前功能：
  * - 检查提醒重发按编号去重，React 提交后才确认展示。
  * - 检查提醒语音复用播放器、可停止，且不能接管本地新输入。
+ * - 检查记忆冲突通知、版本绑定选择、失败重试和旧版本刷新。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +13,7 @@ import { webcrypto } from 'node:crypto';
 import ts from 'typescript';
 
 /** 用真实 Hook 和最小生命周期替身运行网络消息与 React 提交。 */
-async function fixture() {
+async function fixture(options = {}) {
   const slots = [], effects = [], sockets = [], sent = [], audio = [], stops = [];
   let cursor = 0, sequence = 0, result;
   /** 比较依赖，避免测试替身人为重建连接。 */
@@ -80,7 +81,10 @@ async function fixture() {
     crypto: webcrypto, performance, WebSocket: FakeSocket, AbortController,
     window: { location: { protocol: 'http:', host: 'localhost' } },
     /** 返回已有浏览器身份下的新会话。 */
-    async fetch() { return { ok: true, async json() { return { session_id: 'session' }; } }; },
+    async fetch(path, input) {
+      if (options.fetch && path.startsWith('/v1/memories/')) return options.fetch(path, input);
+      return { ok: true, async json() { return { session_id: 'session' }; } };
+    },
     setTimeout, clearTimeout,
   });
   /** 提交一次 React 渲染，再执行展示回执等副作用。 */
@@ -141,5 +145,91 @@ test('提醒语音能停止，本地用户提交后晚到的提醒语音不能�
     app.receive('reminder.speech', { reminder_id: 'r2' }, 'late', 'reminder:r2');
     app.receive('tts.chunk', chunk('late'), 'late', 'reminder:r2');
     assert.equal(app.audio.length, 1);
+  } finally { app.close(); }
+});
+
+/** 构造服务器下发的真实冲突快照字段。 */
+function offer(id = 'pending-1') {
+  return { pending_id: id, target_id: 'old', target_version: 1, target_content: '我喜欢简短回答',
+    candidate: { content: '我喜欢详细回答', evidence: '我喜欢详细回答', domain_scope: 'daily', memory_type: 'preference' },
+    question: '是否使用新信息替换原记录？', reason: '存在冲突', created_at: '2026-10-25T00:00:00+00:00',
+    expires_at: 2000000000, delivery_token: 'token-1' };
+}
+
+test('记忆通知到达不自动授权，展示回执绑定 ID、版本和连接令牌', async () => {
+  const app = await fixture();
+  try {
+    app.receive('memory.pending', { pending: [offer()] });
+    assert.equal(app.sent.filter(item => item.type === 'memory.pending.displayed').length, 0);
+    const state = app.render();
+    assert.equal(state.memoryPending[0].target_content, '我喜欢简短回答');
+    state.acknowledgeMemory(state.memoryPending[0]);
+    assert.equal(app.sent.at(-1).type, 'memory.pending.displayed');
+    assert.deepEqual(JSON.parse(JSON.stringify(app.sent.at(-1).payload)), {
+      pending_id: 'pending-1', target_version: 1, delivery_token: 'token-1',
+    });
+    app.receive('memory.cleared', {});
+    assert.equal(app.render().memoryPending.length, 0);
+  } finally { app.close(); }
+});
+
+test('采纳只提交所选版本，成功回执关闭候选且不清空聊天', async () => {
+  const requests = [];
+  const app = await fixture({ async fetch(path, input) {
+    requests.push({ path, input });
+    return { ok: true, async json() { return { status: 'saved', message: '已采用新信息。' }; } };
+  } });
+  try {
+    app.receive('reminder.due', { reminder_id: 'r', delivery_token: 't', text: '仍然保留的聊天记录' });
+    app.receive('memory.pending', { pending: [offer(), offer('pending-2')] });
+    const state = app.render();
+    await state.resolveMemory(state.memoryPending[0], 'accept_new');
+    assert.equal(requests[0].path, '/v1/memories/pending/pending-1/resolve');
+    assert.deepEqual(JSON.parse(requests[0].input.body), { action: 'accept_new', target_version: 1 });
+    assert.equal(app.render().memoryPending[0].pending_id, 'pending-2');
+    assert.equal(app.render().memoryNotice, '已采用新信息。');
+    app.receive('memory.updated', {});
+    assert.equal(app.render().messages[0].text, '仍然保留的聊天记录');
+  } finally { app.close(); }
+});
+
+test('网络结果不明保留卡片，同一决定可重试，快速重复点击只发一个请求', async () => {
+  let calls = 0, complete;
+  const app = await fixture({ async fetch() {
+    calls += 1;
+    if (calls === 1) throw new Error('connection closed');
+    await new Promise(resolve => { complete = resolve; });
+    return { ok: true, async json() { return { message: '已保留当前记忆。' }; } };
+  } });
+  try {
+    app.receive('memory.pending', { pending: [offer()] });
+    let state = app.render();
+    await state.resolveMemory(state.memoryPending[0], 'keep_old');
+    state = app.render();
+    assert.equal(state.memoryPending.length, 1);
+    assert.match(state.memoryError, /未确认/);
+    const first = state.resolveMemory(state.memoryPending[0], 'keep_old');
+    const second = state.resolveMemory(state.memoryPending[0], 'keep_old');
+    assert.equal(calls, 2);
+    complete();
+    await Promise.all([first, second]);
+    assert.equal(app.render().memoryPending.length, 0);
+    assert.equal(app.render().memoryBusy, false);
+  } finally { app.close(); }
+});
+
+test('目标版本变化后展示明确错误并刷新列表，不伪报更新成功', async () => {
+  const app = await fixture({ async fetch(path, input) {
+    if (input?.method === 'POST') return { ok: false, status: 409, async json() { return { detail: '原记忆已变化，请刷新。' }; } };
+    return { ok: true, async json() { return { pending: [] }; } };
+  } });
+  try {
+    app.receive('memory.pending', { pending: [offer()] });
+    const state = app.render();
+    await state.resolveMemory(state.memoryPending[0], 'accept_new');
+    const refreshed = app.render();
+    assert.equal(refreshed.memoryPending.length, 0);
+    assert.match(refreshed.memoryError, /已变化/);
+    assert.equal(refreshed.memoryNotice, '');
   } finally { app.close(); }
 });

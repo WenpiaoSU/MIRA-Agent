@@ -1,11 +1,14 @@
 """作用：在小规模结构化记忆中进行可解释的中文关键词检索。
 
 当前功能：
-- 使用事实键、英文词与中文双字片段匹配，兼顾简称和问法变化。
+- 使用事实键、英文词、中文双字片段与本地特征向量筛选候选。
 - 普通对话附带称呼与回答风格，限定返回条数和正文预算。
+- 向量仅用于候选筛选，最终事实关系由规则或语义比较决定。
 """
 
 import re
+import hashlib
+import math
 
 from src.contracts.memory import MemoryRecord
 
@@ -46,3 +49,28 @@ def retrieve(records: list[MemoryRecord], query: str, *, preferences: bool = Fal
         if len(selected) == limit:
             break
     return selected
+
+
+def feature_vector(text: str, dimensions: int = 256) -> list[float]:
+    """生成可复现的本地词片段向量，不等同于语义 embedding 模型。"""
+    vector = [0.0] * dimensions
+    for term in terms(text):
+        digest = hashlib.sha256(term.encode("utf-8")).digest()
+        vector[int.from_bytes(digest[:4], "big") % dimensions] += 1 if digest[4] % 2 else -1
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def match_candidates(records: list[MemoryRecord], candidate, limit: int = 8) -> list[MemoryRecord]:
+    """合并精确键、正文与向量召回，候选相似不表示事实相同。"""
+    query = feature_vector(candidate.content + " " + candidate.fact_key)
+    scored = []
+    for record in records:
+        if record.domain_scope != candidate.domain_scope:
+            continue
+        exact = record.fact_key == candidate.fact_key or record.content == candidate.content
+        similarity = sum(left * right for left, right in zip(query, feature_vector(record.content + " " + record.fact_key)))
+        if exact or similarity > .15:
+            scored.append((2 if exact else similarity, record))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [record for _, record in scored[:limit]]

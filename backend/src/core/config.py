@@ -8,7 +8,7 @@
 - 读取意图识别的独立总超时，分类复用现有 LLM 配置。
 - 读取默认时间时区、工具总超时及固定天气来源的启用开关。
 - 读取规划步骤上限与规划/综合回复的独立模型预算。
-- 读取长期记忆 SQLite 路径、启用开关及短期检查点保留时间。
+- 读取长期记忆与检查点路径、Token 压缩阈值、任务容量及保留期限。
 - 读取一次性提醒开关，复用现有 SQLite 文件与默认时区。
 - 读取 M08 的视觉/情感 TTL、迟到窗口与摘要字符预算。
 """
@@ -38,6 +38,10 @@ class Settings:
     memory_db_path: str = getenv("MIRA_MEMORY_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "memory.sqlite3"))
     memory_timeout_ms: int = max(100, int(getenv("MIRA_MEMORY_TIMEOUT_MS", "10000")))
     working_memory_ttl_seconds: int = max(60, int(getenv("MIRA_WORKING_MEMORY_TTL_SECONDS", "3600")))
+    checkpoint_db_path: str = getenv("MIRA_CHECKPOINT_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "checkpoints.sqlite3"))
+    working_memory_token_threshold: int = max(512, int(getenv("MIRA_WORKING_MEMORY_TOKEN_THRESHOLD", "4000")))
+    memory_job_ttl_seconds: int = max(60, int(getenv("MIRA_MEMORY_JOB_TTL_SECONDS", "604800")))
+    memory_queue_limit: int = max(1, min(10000, int(getenv("MIRA_MEMORY_QUEUE_LIMIT", "256"))))
     default_timezone: str = getenv("MIRA_DEFAULT_TIMEZONE", "Asia/Shanghai").strip()
     weather_enabled: bool = getenv("MIRA_WEATHER_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     asr_url: str = getenv("MIRA_ASR_URL", "").strip()

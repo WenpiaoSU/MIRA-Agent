@@ -3,7 +3,9 @@
 当前功能：
 - 使用散列后的随机凭据关联长期用户，数据库不保存原始凭据。
 - 提供按用户隔离的查询、版本更正、物理删除和幂等回执。
-- 在线程中执行短事务；取消与版本检查防止迟到提取重新写回已删除数据。
+- 在线程中执行短事务；版本及删除代次阻止迟到提取恢复已删除数据。
+- 保存有界整合任务与待确认候选，提供批量原子整合、恢复、重试和过期清理。
+- 委托候选存储处理版本绑定、去重及幂等确认，关闭已采纳或拒绝的冲突。
 """
 
 import asyncio
@@ -17,7 +19,8 @@ from threading import Event
 from uuid import uuid4
 from contextlib import closing
 
-from src.contracts.memory import MemoryCandidate, MemoryRecord, MemoryResult
+from src.contracts.memory import MemoryCandidate, MemoryDecision, MemoryRecord, MemoryResult
+from src.repositories.memory_pending import setup_pending, store_pending, list_pending, resolve_pending
 
 
 def token_digest(token: str) -> str:
@@ -44,16 +47,40 @@ class MemoryRepository:
                     evidence TEXT NOT NULL, source_session_id TEXT NOT NULL, source_turn_id TEXT NOT NULL,
                     version INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
                     valid_to TEXT, supersedes_id TEXT);
-                CREATE UNIQUE INDEX IF NOT EXISTS memory_active_key
-                    ON memory_records(user_id, persona_id, fact_key) WHERE status='active';
                 CREATE INDEX IF NOT EXISTS memory_owner ON memory_records(user_id, status);
                 CREATE TABLE IF NOT EXISTS memory_operations (
                     user_id TEXT NOT NULL, operation_id TEXT NOT NULL, result TEXT NOT NULL, request_hash TEXT NOT NULL,
                     PRIMARY KEY(user_id, operation_id));
+                CREATE TABLE IF NOT EXISTS memory_pending (
+                    pending_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+                    candidate TEXT NOT NULL, target_id TEXT, reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL, expires_at REAL NOT NULL,
+                    UNIQUE(user_id, operation_id));
+                CREATE TABLE IF NOT EXISTS memory_jobs (
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, request_hash TEXT NOT NULL, payload TEXT NOT NULL,
+                    epoch INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
+                    expires_at REAL NOT NULL, UNIQUE(user_id, operation_id));
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(memory_operations)")}
             if "request_hash" not in columns:
                 db.execute("ALTER TABLE memory_operations ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
+            record_columns = {row["name"] for row in db.execute("PRAGMA table_info(memory_records)")}
+            for name, declaration in {"memory_type": "TEXT NOT NULL DEFAULT 'fact'",
+                                      "domain_scope": "TEXT NOT NULL DEFAULT 'daily'", "expires_at": "TEXT",
+                                      "confidence": "REAL NOT NULL DEFAULT 1.0",
+                                      "source_kind": "TEXT NOT NULL DEFAULT 'user'",
+                                      "source_ref": "TEXT NOT NULL DEFAULT 'user'"}.items():
+                if name not in record_columns:
+                    db.execute(f"ALTER TABLE memory_records ADD COLUMN {name} {declaration}")
+            user_columns = {row["name"] for row in db.execute("PRAGMA table_info(memory_users)")}
+            if "epoch" not in user_columns:
+                db.execute("ALTER TABLE memory_users ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
+            db.execute("DROP INDEX IF EXISTS memory_active_key")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS memory_active_scope_key ON memory_records "
+                       "(user_id,persona_id,domain_scope,fact_key) WHERE status='active'")
+            setup_pending(db)
             db.commit()
 
     def connect(self):
@@ -118,7 +145,7 @@ class MemoryRepository:
                 raise ValueError("长期用户不存在")
             query = "SELECT * FROM memory_records WHERE user_id=? AND persona_id='mira'"
             if not historical:
-                query += " AND status='active'"
+                query += " AND status='active' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))"
             rows = db.execute(query + " ORDER BY created_at DESC LIMIT 1000", (user_id,)).fetchall()
             return owner["revision"], [MemoryRecord(**dict(row)) for row in rows]
         return await self.run(read)
@@ -158,10 +185,13 @@ class MemoryRepository:
     def write_record(db, user_id, candidate, session_id, turn_id):
         """去重并为明确更正建立新版本，含糊冲突保留原事实并要求澄清。"""
         old = db.execute("SELECT * FROM memory_records WHERE user_id=? AND persona_id='mira' "
-                         "AND fact_key=? AND status='active'", (user_id, candidate.fact_key)).fetchone()
-        if old and old["content"] == candidate.content:
+                         "AND domain_scope=? AND fact_key=? AND status='active'",
+                         (user_id, candidate.domain_scope, candidate.fact_key)).fetchone()
+        expired = bool(old and old["expires_at"] and datetime.fromisoformat(old["expires_at"]) <= datetime.now(timezone.utc))
+        if (old and old["content"] == candidate.content and not expired
+                and (candidate.kind != "episodic" or old["evidence"] == candidate.evidence)):
             return MemoryResult(status="unchanged", message="这条信息已经保存。", memory_ids=[old["memory_id"]])
-        if old and candidate.action != "update":
+        if old and not expired and candidate.action != "update":
             return MemoryResult(status="clarify", message="这与已保存的信息不同。请明确说明要把哪条信息改成什么内容。")
         total = db.execute("SELECT count(*) FROM memory_records WHERE user_id=?", (user_id,)).fetchone()[0]
         if total >= 1000:
@@ -173,7 +203,10 @@ class MemoryRepository:
                               fact_key=candidate.fact_key, content=candidate.content, evidence=candidate.evidence,
                               source_session_id=session_id, source_turn_id=turn_id,
                               version=old["version"] + 1 if old else 1, status="active", created_at=now,
-                              supersedes_id=old["memory_id"] if old else None)
+                              supersedes_id=old["memory_id"] if old else None,
+                              memory_type=candidate.memory_type, domain_scope=candidate.domain_scope,
+                              expires_at=candidate.expires_at, confidence=candidate.confidence,
+                              source_kind=candidate.source_kind, source_ref=candidate.source_ref)
         fields = record.model_dump()
         db.execute("INSERT INTO memory_records (" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")",
                    tuple(fields.values()))
@@ -190,15 +223,168 @@ class MemoryRepository:
             if not candidate.target_ids:
                 return MemoryResult(status="clarify", message="请明确要忘掉哪条信息。")
             placeholders = ",".join("?" for _ in candidate.target_ids)
-            rows = db.execute(f"SELECT fact_key FROM memory_records WHERE user_id=? AND memory_id IN ({placeholders})",
+            rows = db.execute(f"SELECT fact_key,domain_scope FROM memory_records WHERE user_id=? AND memory_id IN ({placeholders})",
                               (user_id, *candidate.target_ids)).fetchall()
             if len(rows) != len(set(candidate.target_ids)):
                 return MemoryResult(status="failed", message="未找到属于当前用户的完整删除目标。")
-            keys = list({row["fact_key"] for row in rows})
-            placeholders = ",".join("?" for _ in keys)
-            selected = db.execute(f"SELECT memory_id FROM memory_records WHERE user_id=? AND fact_key IN ({placeholders})",
-                                  (user_id, *keys)).fetchall()
-            db.execute(f"DELETE FROM memory_records WHERE user_id=? AND fact_key IN ({placeholders})", (user_id, *keys))
+            selected = []
+            for scope, key in {(row["domain_scope"], row["fact_key"]) for row in rows}:
+                selected.extend(db.execute("SELECT memory_id FROM memory_records WHERE user_id=? AND domain_scope=? AND fact_key=?",
+                                           (user_id, scope, key)).fetchall())
+                db.execute("DELETE FROM memory_records WHERE user_id=? AND domain_scope=? AND fact_key=?", (user_id, scope, key))
+        # 删除撤销该用户的全部未完成整合，运行中的模型结果也必须再次核对 epoch。
+        db.execute("UPDATE memory_users SET epoch=epoch+1 WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM memory_jobs WHERE user_id=?", (user_id,))
+        db.execute("DELETE FROM memory_pending WHERE user_id=?", (user_id,))
         db.execute("DELETE FROM memory_operations WHERE user_id=?", (user_id,))
         return MemoryResult(status="deleted", message=f"已删除 {len(selected)} 条长期记忆记录（含历史版本），并清空相关会话上下文。",
                             deleted_count=len(selected), cleared=True)
+
+    async def epoch(self, user_id):
+        """读取删除代次，用于约束排队任务和正在运行的语义提取。"""
+        def read(db):
+            """不存在的用户不能创建或恢复整合任务。"""
+            row = db.execute("SELECT epoch FROM memory_users WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                raise ValueError("长期用户不存在")
+            return row["epoch"]
+        return await self.run(read)
+
+    async def integrate(self, user_id, operation_id, decisions: list[MemoryDecision], revision,
+                        epoch, session_id, turn_id, request_text, pending_ttl=604800):
+        """在一个事务内整合多个事实；相似度结果不能直接进入写入事务。"""
+        request_hash = token_digest(request_text)
+
+        def apply(db):
+            """核对幂等、版本与删除代次，任何失败回滚整组操作。"""
+            owner = db.execute("SELECT revision,epoch FROM memory_users WHERE user_id=?", (user_id,)).fetchone()
+            if not owner or owner["epoch"] != epoch:
+                return MemoryResult(status="conflict", message="记忆删除后旧候选已失效，请重新提供需要保存的信息。")
+            previous = db.execute("SELECT result,request_hash FROM memory_operations WHERE user_id=? AND operation_id=?",
+                                  (user_id, operation_id)).fetchone()
+            if previous:
+                if previous["request_hash"] != request_hash:
+                    return MemoryResult(status="conflict", message="同一轮次对应不同的记忆内容，请重新提交。")
+                return MemoryResult.model_validate_json(previous["result"])
+            if owner["revision"] != revision:
+                return MemoryResult(status="conflict", message="记忆发生并发变化，本次未覆盖，请重新说明。")
+            ids, actions, pending_ids = [], [], []
+            db.execute("SAVEPOINT memory_batch")
+            for index, decision in enumerate(decisions):
+                candidate = decision.candidate
+                actions.append(decision.action)
+                if decision.action == "PENDING":
+                    try:
+                        pending_id, waiting = store_pending(db, user_id, operation_id + f":{index}", decision,
+                                                            session_id, turn_id, epoch, pending_ttl)
+                    except ValueError:
+                        db.execute("ROLLBACK TO memory_batch")
+                        return MemoryResult(status="failed", message="待确认候选已达到容量上限，请先清理。")
+                    if waiting:
+                        pending_ids.append(pending_id)
+                    else:
+                        actions[-1] = "SKIP"
+                elif decision.action == "SKIP":
+                    if decision.target_id:
+                        ids.append(decision.target_id)
+                else:
+                    if decision.action == "UPDATE":
+                        target = db.execute("SELECT fact_key,domain_scope FROM memory_records WHERE user_id=? AND memory_id=? AND status='active'",
+                                            (user_id, decision.target_id)).fetchone()
+                        if not target or target["domain_scope"] != candidate.domain_scope:
+                            db.execute("ROLLBACK TO memory_batch")
+                            return MemoryResult(status="conflict", message="更正目标已失效，本次未写入。")
+                        candidate = candidate.model_copy(update={"action": "update", "fact_key": target["fact_key"]})
+                    else:
+                        candidate = candidate.model_copy(update={"action": "remember"})
+                    result = self.write_record(db, user_id, candidate, session_id, turn_id)
+                    if result.status not in {"saved", "unchanged"}:
+                        db.execute("ROLLBACK TO memory_batch")
+                        return result
+                    ids.extend(result.memory_ids)
+                    if decision.action == "UPDATE":
+                        db.execute("UPDATE memory_pending SET status='stale' WHERE user_id=? AND target_id=? AND status='pending'",
+                                   (user_id, decision.target_id))
+            changed = any(action in {"ADD", "UPDATE"} for action in actions)
+            pending = "PENDING" in actions
+            status = "pending" if pending else "saved" if changed else "unchanged"
+            message = ("存在冲突，原事实保持有效；请在待确认记忆中选择使用新信息或保留原记录。" if pending else
+                       "已保存或更新这些长期记忆。" if changed else "没有需要新增的长期记忆。")
+            result = MemoryResult(status=status, message=message, memory_ids=ids, decisions=actions, pending_ids=pending_ids)
+            if changed:
+                db.execute("UPDATE memory_users SET revision=revision+1 WHERE user_id=?", (user_id,))
+            db.execute("INSERT INTO memory_operations VALUES (?,?,?,?)", (user_id, operation_id, result.model_dump_json(), request_hash))
+            db.execute("DELETE FROM memory_operations WHERE user_id=? AND rowid NOT IN "
+                       "(SELECT rowid FROM memory_operations WHERE user_id=? ORDER BY rowid DESC LIMIT 256)", (user_id, user_id))
+            return result
+        return await self.run(apply)
+
+    async def pending(self, user_id):
+        """只向本人返回尚未过期的候选，不混入有效事实快照。"""
+        def read(db):
+            """清理过期候选后返回有界列表。"""
+            return list_pending(db, user_id)
+        return await self.run(read)
+
+    async def resolve_pending(self, user_id, pending_id, request, *, evidence="", after_commit=None):
+        """原子确认一个目标版本绑定的候选，只有真实变化才触发派生缓存失效。"""
+        def apply(db):
+            """复用主库连接和事实版本写入，确认过程不调用模型。"""
+            return resolve_pending(db, user_id, pending_id, request, self.write_record, evidence)
+        return await self.run(apply, after_commit)
+
+    async def delete_pending(self, user_id, pending_id):
+        """按所有权删除一个候选，并撤销可能重新产生该候选的旧后台任务。"""
+        def remove(db):
+            """目标不存在时不改变其他用户或当前用户的有效事实。"""
+            changed = db.execute("DELETE FROM memory_pending WHERE user_id=? AND pending_id=?", (user_id, pending_id)).rowcount
+            if changed:
+                db.execute("UPDATE memory_users SET epoch=epoch+1,revision=revision+1 WHERE user_id=?", (user_id,))
+                db.execute("UPDATE memory_pending SET epoch=epoch+1 WHERE user_id=? AND status='pending'", (user_id,))
+                db.execute("DELETE FROM memory_jobs WHERE user_id=?", (user_id,))
+                db.execute("DELETE FROM memory_operations WHERE user_id=?", (user_id,))
+            return bool(changed)
+        return await self.run(remove)
+
+    async def enqueue(self, user_id, operation_id, payload, ttl_seconds=604800, limit=256):
+        """持久化有界整合任务；入队回执不表示事实已保存。"""
+        def add(db):
+            """按用户和轮次去重，记录原始删除代次，拒绝不同正文复用 ID。"""
+            now = datetime.now(timezone.utc).timestamp()
+            db.execute("DELETE FROM memory_jobs WHERE expires_at<=?", (now,))
+            previous = db.execute("SELECT request_hash FROM memory_jobs WHERE user_id=? AND operation_id=?", (user_id, operation_id)).fetchone()
+            digest = token_digest(payload["text"])
+            if previous:
+                return previous["request_hash"] == digest
+            owner = db.execute("SELECT epoch FROM memory_users WHERE user_id=?", (user_id,)).fetchone()
+            if not owner or db.execute("SELECT count(*) FROM memory_jobs").fetchone()[0] >= limit:
+                return False
+            db.execute("INSERT INTO memory_jobs(user_id,operation_id,request_hash,payload,epoch,available_at,expires_at) VALUES (?,?,?,?,?,?,?)",
+                       (user_id, operation_id, digest, json.dumps(payload, ensure_ascii=False), owner["epoch"], now, now + ttl_seconds))
+            return True
+        return await self.run(add)
+
+    async def claim_job(self, lease_seconds=120):
+        """领取一个任务；进程崩溃留下的运行任务在租约到期后可恢复。"""
+        def claim(db):
+            """原子领取并增加尝试次数，过期和超过三次的任务直接清理。"""
+            now = datetime.now(timezone.utc).timestamp()
+            db.execute("DELETE FROM memory_jobs WHERE expires_at<=? OR (attempts>=3 AND available_at<=?)", (now, now))
+            db.execute("DELETE FROM memory_pending WHERE expires_at<=?", (now,))
+            row = db.execute("SELECT * FROM memory_jobs WHERE available_at<=? ORDER BY job_id LIMIT 1", (now,)).fetchone()
+            if not row:
+                return None
+            db.execute("UPDATE memory_jobs SET status='running',attempts=attempts+1,available_at=? WHERE job_id=?", (now + lease_seconds, row["job_id"]))
+            return {**dict(row), "payload": json.loads(row["payload"])}
+        return await self.run(claim)
+
+    async def finish_job(self, job_id, *, retry=False):
+        """完成任务即清除原文；暂时失败以有限退避重试。"""
+        def finish(db):
+            """删除结果任务或恢复待领取状态，最多尝试三次。"""
+            if retry:
+                now = datetime.now(timezone.utc).timestamp()
+                db.execute("UPDATE memory_jobs SET status='queued',available_at=? WHERE job_id=?", (now + 5, job_id))
+            else:
+                db.execute("DELETE FROM memory_jobs WHERE job_id=?", (job_id,))
+        return await self.run(finish)

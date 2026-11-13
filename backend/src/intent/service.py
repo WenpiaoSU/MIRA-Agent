@@ -39,16 +39,13 @@ tool_request：需要实际查询或操作的请求，例如“查一下杭州�
 提醒属于业务工具，不是长期记忆；取消提醒不是停止输出。title、due_at 保留用户原文，禁止计算日期；timezone 不明确时省略，采用配置默认时区。
 提醒时间如“明天三点”仍提取原文，让工具追问上午或下午；“查天气并创建提醒”等组合目标交给任务规划。
 即使目录没有对应能力，明确的工具请求仍归 tool_request，但 tool_intent=null，不编造工具名；能力不可用不等于参数歧义。
-memory_query：查询用户过去告诉过系统的信息，例如“你记得我的研究方向吗”。
-memory_update：提供、修改或删除稳定事实或偏好，例如“我喜欢简短回答”“以后叫我小苏”“忘掉我的住址”。
-记忆槽位使用 operation=update/delete、target、value；暂时的情绪或随口寒暄不是长期事实。
 control：用户实际要求停止、取消、继续、重复或换话题；control_action 使用 stop/cancel/resume/repeat/change_topic。
 引用、否定或讨论控制命令不属于 control，例如“不要停止”“他说停一下是什么意思”。
 other：无法可靠确定目的；多个独立执行任务无法确定优先顺序时也用 other 并澄清。
 寒暄加提问优先 question。信息不足时不猜参数；已有明确意图但缺参数时保留意图并标记 needs_clarification。
 所有非空槽位必须提供输入或上下文中的原文 evidence。时间不明确时保留原文，不猜绝对日期、时区或地点。
 confidence 是可为空的自评，不代表事实可信度、权限或操作已经成功。非工具意图 tool_intent=null，非控制意图 control_action=null。
-只识别请求，不执行工具、记忆写入或播放控制。
+只识别请求，不执行工具或播放控制。
 pending_clarification 是正在等待用户补充的单个工具请求。用户补充其参数时，选择原工具并令 continues_pending=true，
 slots 只填写本轮明确提供或纠正的参数，已有参数由服务端合并。例如等待天气地点时回答“杭州, 浙江”属于补充。
 独立的新请求、换任务或普通交流令 continues_pending=false，不从待澄清请求继承地点或日期。
