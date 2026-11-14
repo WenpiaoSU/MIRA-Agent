@@ -1,0 +1,70 @@
+<svg width="1600" height="760" viewBox="0 0 1600 760" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="80" y1="40" x2="1510" y2="730" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#11162E"/>
+      <stop offset="0.55" stop-color="#1A1B3D"/>
+      <stop offset="1" stop-color="#352356"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="300" y1="110" x2="850" y2="700" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8BE9FD" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#BD93F9" stop-opacity="0.05"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    </linearGradient>
+    <filter id="blur" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="42"/>
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#060817" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="760" rx="36" fill="url(#bg)"/>
+  <circle cx="330" cy="160" r="190" fill="#6EE7F9" fill-opacity="0.16" filter="url(#blur)"/>
+  <circle cx="1330" cy="640" r="240" fill="#BD93F9" fill-opacity="0.18" filter="url(#blur)"/>
+  <path d="M0 620C290 540 390 700 680 630C950 564 1140 445 1600 530V760H0V620Z" fill="url(#glow)" fill-opacity="0.28"/>
+
+  <g filter="url(#shadow)">
+    <rect x="88" y="92" width="760" height="576" rx="28" fill="#0D1027" fill-opacity="0.76" stroke="#FFFFFF" stroke-opacity="0.14"/>
+    <rect x="124" y="132" width="688" height="56" rx="16" fill="#FFFFFF" fill-opacity="0.07"/>
+    <circle cx="156" cy="160" r="8" fill="#FF6B81"/>
+    <circle cx="184" cy="160" r="8" fill="#FFD166"/>
+    <circle cx="212" cy="160" r="8" fill="#66E3A5"/>
+    <text x="256" y="169" fill="#E8EAF6" font-family="Inter,Segoe UI,sans-serif" font-size="20" font-weight="600">MIRA-Agent</text>
+
+    <rect x="148" y="238" width="350" height="76" rx="20" fill="url(#card)" stroke="#FFFFFF" stroke-opacity="0.1"/>
+    <circle cx="182" cy="276" r="18" fill="#8BE9FD" fill-opacity="0.22"/>
+    <path d="M174 276C178 267 187 267 191 276C187 285 178 285 174 276Z" fill="#8BE9FD"/>
+    <rect x="216" y="260" width="228" height="10" rx="5" fill="#FFFFFF" fill-opacity="0.85"/>
+    <rect x="216" y="281" width="164" height="9" rx="4.5" fill="#FFFFFF" fill-opacity="0.3"/>
+
+    <rect x="352" y="352" width="426" height="108" rx="22" fill="#7C5CFC" fill-opacity="0.62"/>
+    <rect x="386" y="381" width="284" height="11" rx="5.5" fill="#FFFFFF" fill-opacity="0.92"/>
+    <rect x="386" y="407" width="212" height="10" rx="5" fill="#FFFFFF" fill-opacity="0.38"/>
+    <circle cx="725" cy="406" r="24" fill="#FFFFFF" fill-opacity="0.14"/>
+    <path d="M716 406H734M725 397V415" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+
+    <rect x="148" y="520" width="630" height="94" rx="20" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.08"/>
+    <rect x="178" y="554" width="388" height="12" rx="6" fill="#FFFFFF" fill-opacity="0.2"/>
+    <rect x="594" y="543" width="142" height="34" rx="17" fill="#8BE9FD" fill-opacity="0.18" stroke="#8BE9FD" stroke-opacity="0.48"/>
+    <text x="620" y="565" fill="#8BE9FD" font-family="Inter,Segoe UI,sans-serif" font-size="14" font-weight="600">Listening</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="928" y="82" width="560" height="596" rx="30" fill="#0D1027" fill-opacity="0.54" stroke="#FFFFFF" stroke-opacity="0.12"/>
+    <circle cx="1208" cy="350" r="190" fill="#8BE9FD" fill-opacity="0.08"/>
+    <path d="M1048 522C1066 440 1100 398 1208 398C1316 398 1350 440 1368 522C1308 574 1108 574 1048 522Z" fill="#C9F2F8" fill-opacity="0.92"/>
+    <ellipse cx="1208" cy="309" rx="126" ry="146" fill="#FFF4F0"/>
+    <path d="M1097 280C1109 186 1298 166 1323 288C1290 261 1260 247 1222 247C1170 247 1138 268 1097 280Z" fill="#B8B7DA"/>
+    <path d="M1132 318C1154 335 1173 335 1190 320M1227 320C1244 335 1264 335 1285 318" stroke="#6C5B86" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="1166" cy="294" r="10" fill="#25305F"/>
+    <circle cx="1250" cy="294" r="10" fill="#25305F"/>
+    <path d="M1187 371C1200 381 1216 381 1229 371" stroke="#E4879B" stroke-width="8" stroke-linecap="round"/>
+    <path d="M1068 516C1117 486 1299 486 1348 516" stroke="#8BE9FD" stroke-width="4" stroke-linecap="round" stroke-opacity="0.9"/>
+    <text x="1000" y="620" fill="#FFFFFF" fill-opacity="0.78" font-family="Inter,Segoe UI,sans-serif" font-size="18" letter-spacing="3">VOICE • MEMORY • PRESENCE</text>
+  </g>
+
+  <text x="100" y="716" fill="#FFFFFF" fill-opacity="0.72" font-family="Inter,Segoe UI,sans-serif" font-size="16">A voice-first Live2D companion for natural conversations</text>
+</svg>
